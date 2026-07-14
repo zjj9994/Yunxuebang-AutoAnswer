@@ -194,13 +194,45 @@ class OCREngine:
         识别图片中的文字，返回节点列表
         每个节点: {text, bounds, confidence}
         """
-        if self._engine_name == "PaddleOCR":
-            return self._recognize_paddle(image_path)
-        elif self._engine_name == "RapidOCR":
-            return self._recognize_rapid(image_path)
-        elif self._engine_name == "EasyOCR":
-            return self._recognize_easy(image_path)
+        try:
+            if self._engine_name == "PaddleOCR":
+                return self._recognize_paddle(image_path)
+            elif self._engine_name == "RapidOCR":
+                return self._recognize_rapid(image_path)
+            elif self._engine_name == "EasyOCR":
+                return self._recognize_easy(image_path)
+        except Exception as e:
+            logger.error(f"OCR 识别异常: {e}", exc_info=True)
         return []
+
+    def _parse_box(self, box) -> dict:
+        """解析 OCR 检测框坐标，返回中心点和边界（兼容 numpy 类型）"""
+        try:
+            xs = [float(p[0]) for p in box]
+            ys = [float(p[1]) for p in box]
+            cx = int(sum(xs) / 4)
+            cy = int(sum(ys) / 4)
+            x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+            return {
+                "bounds": (cx, cy),
+                "bounds_str": f"[{x1},{y1}][{x2},{y2}]",
+            }
+        except Exception:
+            return {"bounds": None, "bounds_str": ""}
+
+    def _make_node(self, text: str, conf, box_info: dict) -> dict:
+        """构建 OCR 节点"""
+        return {
+            "text": text.strip(),
+            "desc": "",
+            "display": text.strip(),
+            "bounds": box_info["bounds"],
+            "bounds_str": box_info["bounds_str"],
+            "clickable": False,
+            "class": "OCR",
+            "resource_id": "",
+            "confidence": float(conf) if conf is not None else 0.0,
+        }
 
     def _recognize_paddle(self, image_path: str) -> list:
         """PaddleOCR 识别"""
@@ -212,29 +244,18 @@ class OCREngine:
         for line in result[0]:
             box = line[0]       # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
             text = line[1][0]   # text
-            conf = line[1][1]   # confidence
+            try:
+                conf = float(line[1][1])
+            except (ValueError, TypeError):
+                conf = 0.0
 
             if conf < 0.5 or not text.strip():
                 continue
 
-            # 计算中心点和边界
-            xs = [p[0] for p in box]
-            ys = [p[1] for p in box]
-            cx = int(sum(xs) / 4)
-            cy = int(sum(ys) / 4)
-            x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
-
-            nodes.append({
-                "text": text.strip(),
-                "desc": "",
-                "display": text.strip(),
-                "bounds": (cx, cy),
-                "bounds_str": f"[{x1},{y1}][{x2},{y2}]",
-                "clickable": False,
-                "class": "OCR",
-                "resource_id": "",
-                "confidence": float(conf),
-            })
+            box_info = self._parse_box(box)
+            if not box_info["bounds"]:
+                continue
+            nodes.append(self._make_node(text, conf, box_info))
         return nodes
 
     def _recognize_rapid(self, image_path: str) -> list:
@@ -247,28 +268,19 @@ class OCREngine:
         for item in result:
             box = item[0]       # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
             text = item[1]
-            conf = item[2]
+            # RapidOCR 返回 score 为字符串 '0.99'，需转换为 float
+            try:
+                conf = float(item[2])
+            except (ValueError, TypeError, IndexError):
+                conf = 0.0
 
             if conf < 0.5 or not text.strip():
                 continue
 
-            xs = [p[0] for p in box]
-            ys = [p[1] for p in box]
-            cx = int(sum(xs) / 4)
-            cy = int(sum(ys) / 4)
-            x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
-
-            nodes.append({
-                "text": text.strip(),
-                "desc": "",
-                "display": text.strip(),
-                "bounds": (cx, cy),
-                "bounds_str": f"[{x1},{y1}][{x2},{y2}]",
-                "clickable": False,
-                "class": "OCR",
-                "resource_id": "",
-                "confidence": float(conf),
-            })
+            box_info = self._parse_box(box)
+            if not box_info["bounds"]:
+                continue
+            nodes.append(self._make_node(text, conf, box_info))
         return nodes
 
     def _recognize_easy(self, image_path: str) -> list:
@@ -281,28 +293,18 @@ class OCREngine:
         for item in result:
             box = item[0]       # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
             text = item[1]
-            conf = item[2]
+            try:
+                conf = float(item[2])
+            except (ValueError, TypeError, IndexError):
+                conf = 0.0
 
             if conf < 0.5 or not text.strip():
                 continue
 
-            xs = [p[0] for p in box]
-            ys = [p[1] for p in box]
-            cx = int(sum(xs) / 4)
-            cy = int(sum(ys) / 4)
-            x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
-
-            nodes.append({
-                "text": text.strip(),
-                "desc": "",
-                "display": text.strip(),
-                "bounds": (cx, cy),
-                "bounds_str": f"[{x1},{y1}][{x2},{y2}]",
-                "clickable": False,
-                "class": "OCR",
-                "resource_id": "",
-                "confidence": float(conf),
-            })
+            box_info = self._parse_box(box)
+            if not box_info["bounds"]:
+                continue
+            nodes.append(self._make_node(text, conf, box_info))
         return nodes
 
 
