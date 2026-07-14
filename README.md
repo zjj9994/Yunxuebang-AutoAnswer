@@ -16,6 +16,7 @@
 
 - **电脑端**：Playwright 驱动浏览器打开 DeepSeek 网页版，发送题目获取答案
 - **手机端**：uiautomator2 控制微信中的云学帮小程序，提取题目、选择答案
+- **OCR 回退**：微信小程序渲染在 WebView 中，`dump_hierarchy()` 无法获取内容时自动回退到 OCR 截图识别
 
 ## 快速开始
 
@@ -33,7 +34,25 @@ export PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 playwright install chromium
 ```
 
-### 2. 准备安卓模拟器
+### 2. 安装 OCR 库（重要！）
+
+微信小程序的内容渲染在 WebView 中，uiautomator2 的 `dump_hierarchy()` **无法直接读取** WebView 内容。
+脚本会在无障碍树提取失败时自动回退到 **OCR 截图识别**。
+
+三选一安装（推荐 RapidOCR，轻量且无需 PaddlePaddle/Torch）：
+
+```bash
+# 推荐：RapidOCR（轻量级，基于 ONNX Runtime）
+pip install rapidocr-onnxruntime
+
+# 或：PaddleOCR（最准确，但较重）
+pip install paddlepaddle paddleocr
+
+# 或：EasyOCR（需要 PyTorch）
+pip install easyocr
+```
+
+### 3. 准备安卓模拟器
 
 推荐使用以下模拟器之一：
 - **雷电模拟器**（推荐）：默认端口 5555
@@ -51,7 +70,7 @@ adb devices
 # emulator-5554    device
 ```
 
-### 3. 运行
+### 4. 运行
 
 ```bash
 python main.py
@@ -76,12 +95,17 @@ python main.py
   |
   v
 +---> 从小程序界面提取题目
+|       ├── 策略1: 无障碍树 (dump_hierarchy)
+|       └── 策略2: OCR 截图识别（WebView 回退）
 |       |
 |       v
 |   DeepSeek 获取答案
 |       |
 |       v
 |   在小程序中选择答案
+|       ├── 策略1: 无障碍树定位点击
+|       ├── 策略2: OCR 定位点击
+|       └── 策略3: 坐标比例点击
 |       |
 |       v
 |   下一题（循环）
@@ -101,7 +125,7 @@ python main.py
 | `--auto-open` | 自动在微信中搜索并打开云学帮小程序 |
 | `--mp-name NAME` | 指定小程序名称（默认"云学帮"） |
 | `--delay SECONDS` | 每题之间的延迟秒数 |
-| `--inspect` | 检查屏幕 UI 结构（调试用） |
+| `--inspect` | 检查屏幕 UI 结构 + OCR 识别结果（调试用） |
 | `--debug` | 开启调试日志 |
 | `--ds-url URL` | 指定 DeepSeek 网页地址 |
 
@@ -113,7 +137,7 @@ Yunxuebang-AutoAnswer/
 ├── config.py                # 配置模块
 ├── models.py                # 共享数据结构 (Question/AnswerResult)
 ├── deepseek_web_client.py   # DeepSeek 网页版客户端 (Playwright)
-├── wechat_automator.py      # 微信小程序自动化 (uiautomator2)
+├── wechat_automator.py      # 微信小程序自动化 (uiautomator2 + OCR)
 ├── requirements.txt         # Python 依赖
 └── README.md                # 说明文档
 ```
@@ -133,11 +157,17 @@ Yunxuebang-AutoAnswer/
 
 ### 屏幕检查模式
 
-题目识别不出来时，用检查模式查看小程序的 UI 结构：
+题目识别不出来时，用检查模式查看小程序的 UI 结构和 OCR 识别结果：
 
 ```bash
 python main.py --inspect
 ```
+
+该模式会同时输出：
+- 无障碍树原始节点（标注哪些被过滤为噪音）
+- 过滤后的有效节点
+- OCR 识别结果（文本 + 置信度 + 坐标）
+- 自动解析的题目和选项
 
 ### 开启调试日志
 
@@ -160,6 +190,7 @@ python main.py --debug
 ## 注意事项
 
 - **无需任何 API Key**，直接使用 DeepSeek 网页版
+- **必须安装 OCR 库**（RapidOCR/PaddleOCR/EasyOCR 三选一），否则无法识别 WebView 中的题目内容
 - 需要在模拟器中安装微信并登录
 - 首次运行需要手动登录 DeepSeek 和微信
 - 默认不自动提交试卷，需按回车确认

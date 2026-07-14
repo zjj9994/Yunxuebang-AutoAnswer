@@ -56,6 +56,7 @@ def print_banner():
 |  AI 引擎: DeepSeek 网页版 (chat.deepseek.com)             |
 |  平台: 云学帮 (微信小程序)                                 |
 |  引擎: Playwright (DeepSeek) + uiautomator2 (微信)       |
+|  OCR 回退: RapidOCR / PaddleOCR / EasyOCR                |
 |  特点: 无需 API Key，直接使用网页版对话                    |
 +----------------------------------------------------------+
 """

@@ -3,11 +3,14 @@
 通过安卓模拟器运行微信，在微信中打开云学帮小程序
 电脑端通过 DeepSeek 网页版获取答案
 
-关键改进 v3:
+关键改进 v4:
+  - OCR 截图识别作为 WebView 内容提取回退
+    （微信小程序渲染在 WebView 中，dump_hierarchy 无法获取内容时自动回退到 OCR）
+  - 修复 device.scroll 崩溃问题
+  - 修复 resourceClass → className
+  - 连续失败时不立即关闭 DeepSeek，提供手动输入回退
   - 过滤状态栏/系统 UI 文本（电池、信号、时间等）
   - 过滤微信和小程序的导航栏文本
-  - 手动输入题目回退模式
-  - 截图调试
   - 多策略选项点击
   - 重试机制
 """
@@ -34,6 +37,7 @@ STATUS_BAR_KEYWORDS = [
     "闹钟", "通知", "状态栏", "运营商", "中国移动", "中国联通", "中国电信",
     "GPRS", "EDGE", "LTE", "5G", "4G", "3G", "HD",
     "自动旋转", "勿扰", "护眼", "热点",
+    "WLAN", "手机信号", "微信通知", "微信团队",
 ]
 
 # 微信 / 小程序导航栏黑名单
@@ -106,7 +110,7 @@ def _is_noise_node(node: dict) -> bool:
     if _is_button_text(text):
         return True
 
-    # 太短的文本（< 3 个字符，可能是图标 label）
+    # 太短的文本（< 2 个字符，可能是图标 label）
     if len(text) < 2:
         return True
 
@@ -114,14 +118,192 @@ def _is_noise_node(node: dict) -> bool:
     if re.match(r"^[\s\d\W]+$", text) and len(text) < 5:
         return True
 
-    # 状态栏区域（屏幕顶部 5%）
+    # 状态栏区域（屏幕顶部 y < 150px）
     bounds = node.get("bounds")
     if bounds:
-        # 假设屏幕高度约 2000-3000px，状态栏约在 y < 150
-        if bounds[1] < 150:
-            return True
+        if isinstance(bounds, (tuple, list)) and len(bounds) >= 2:
+            y = bounds[1]
+            if isinstance(y, int) and y < 150:
+                return True
 
     return False
+
+
+class OCREngine:
+    """OCR 引擎封装，支持多种后端"""
+
+    _instance = None
+    _engine_name = None
+    _ocr = None
+
+    @classmethod
+    def get_instance(cls):
+        """获取 OCR 实例（单例），自动选择可用后端"""
+        if cls._instance is not None:
+            return cls._instance
+
+        # 尝试 PaddleOCR
+        try:
+            from paddleocr import PaddleOCR
+            cls._ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False)
+            cls._engine_name = "PaddleOCR"
+            cls._instance = cls()
+            logger.info("OCR 引擎: PaddleOCR")
+            return cls._instance
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"PaddleOCR 初始化失败: {e}")
+
+        # 尝试 RapidOCR (轻量级)
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            cls._ocr = RapidOCR()
+            cls._engine_name = "RapidOCR"
+            cls._instance = cls()
+            logger.info("OCR 引擎: RapidOCR")
+            return cls._instance
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"RapidOCR 初始化失败: {e}")
+
+        # 尝试 EasyOCR
+        try:
+            import easyocr
+            cls._ocr = easyocr.Reader(['ch_sim', 'en'], verbose=False)
+            cls._engine_name = "EasyOCR"
+            cls._instance = cls()
+            logger.info("OCR 引擎: EasyOCR")
+            return cls._instance
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"EasyOCR 初始化失败: {e}")
+
+        logger.warning(
+            "未找到可用的 OCR 库！请安装其中之一:\n"
+            "  pip install rapidocr-onnxruntime  (推荐，轻量级)\n"
+            "  pip install paddlepaddle paddleocr  (最准确，较重)\n"
+            "  pip install easyocr  (需要 torch)"
+        )
+        return None
+
+    def recognize(self, image_path: str) -> list:
+        """
+        识别图片中的文字，返回节点列表
+        每个节点: {text, bounds, confidence}
+        """
+        if self._engine_name == "PaddleOCR":
+            return self._recognize_paddle(image_path)
+        elif self._engine_name == "RapidOCR":
+            return self._recognize_rapid(image_path)
+        elif self._engine_name == "EasyOCR":
+            return self._recognize_easy(image_path)
+        return []
+
+    def _recognize_paddle(self, image_path: str) -> list:
+        """PaddleOCR 识别"""
+        result = self._ocr.ocr(image_path, cls=True)
+        nodes = []
+        if not result or not result[0]:
+            return nodes
+
+        for line in result[0]:
+            box = line[0]       # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            text = line[1][0]   # text
+            conf = line[1][1]   # confidence
+
+            if conf < 0.5 or not text.strip():
+                continue
+
+            # 计算中心点和边界
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+            cx = int(sum(xs) / 4)
+            cy = int(sum(ys) / 4)
+            x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+
+            nodes.append({
+                "text": text.strip(),
+                "desc": "",
+                "display": text.strip(),
+                "bounds": (cx, cy),
+                "bounds_str": f"[{x1},{y1}][{x2},{y2}]",
+                "clickable": False,
+                "class": "OCR",
+                "resource_id": "",
+                "confidence": float(conf),
+            })
+        return nodes
+
+    def _recognize_rapid(self, image_path: str) -> list:
+        """RapidOCR 识别"""
+        result, elapse = self._ocr(image_path)
+        nodes = []
+        if not result:
+            return nodes
+
+        for item in result:
+            box = item[0]       # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            text = item[1]
+            conf = item[2]
+
+            if conf < 0.5 or not text.strip():
+                continue
+
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+            cx = int(sum(xs) / 4)
+            cy = int(sum(ys) / 4)
+            x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+
+            nodes.append({
+                "text": text.strip(),
+                "desc": "",
+                "display": text.strip(),
+                "bounds": (cx, cy),
+                "bounds_str": f"[{x1},{y1}][{x2},{y2}]",
+                "clickable": False,
+                "class": "OCR",
+                "resource_id": "",
+                "confidence": float(conf),
+            })
+        return nodes
+
+    def _recognize_easy(self, image_path: str) -> list:
+        """EasyOCR 识别"""
+        result = self._ocr.readtext(image_path)
+        nodes = []
+        if not result:
+            return nodes
+
+        for item in result:
+            box = item[0]       # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            text = item[1]
+            conf = item[2]
+
+            if conf < 0.5 or not text.strip():
+                continue
+
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+            cx = int(sum(xs) / 4)
+            cy = int(sum(ys) / 4)
+            x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+
+            nodes.append({
+                "text": text.strip(),
+                "desc": "",
+                "display": text.strip(),
+                "bounds": (cx, cy),
+                "bounds_str": f"[{x1},{y1}][{x2},{y2}]",
+                "clickable": False,
+                "class": "OCR",
+                "resource_id": "",
+                "confidence": float(conf),
+            })
+        return nodes
 
 
 class WeChatMiniProgramAutomator:
@@ -133,6 +315,8 @@ class WeChatMiniProgramAutomator:
         self.device = None
         self.ds_client = None
         self._screenshot_count = 0
+        self._ocr_engine = None
+        self._ocr_initialized = False
 
     async def start(self):
         """连接 Android 设备并初始化 DeepSeek 客户端"""
@@ -150,7 +334,15 @@ class WeChatMiniProgramAutomator:
         logger.info(f"已连接设备: {self.device.info}")
         self.device.implicitly_wait(self.config.ui_timeout)
 
-    async def screenshot(self, tag: str = ""):
+    def _init_ocr(self):
+        """延迟初始化 OCR 引擎"""
+        if self._ocr_initialized:
+            return
+        self._ocr_initialized = True
+        self._ocr_engine = OCREngine.get_instance()
+
+    async def screenshot(self, tag: str = "") -> str:
+        """截图并返回文件路径"""
         def _shot():
             try:
                 self._screenshot_count += 1
@@ -158,14 +350,16 @@ class WeChatMiniProgramAutomator:
                 filename = f"{SCREENSHOT_DIR}/{self._screenshot_count:03d}_{ts}_{tag}.png"
                 self.device.screenshot(filename)
                 logger.debug(f"截图: {filename}")
-            except Exception:
-                pass
-        await asyncio.to_thread(_shot)
+                return filename
+            except Exception as e:
+                logger.warning(f"截图失败: {e}")
+                return ""
+        return await asyncio.to_thread(_shot)
 
     async def open_wechat(self):
         def _open():
             self.device.app_start(self.config.wechat_package)
-            logger.info(f"已启动微信")
+            logger.info("已启动微信")
             time.sleep(3)
         await asyncio.to_thread(_open)
 
@@ -203,8 +397,10 @@ class WeChatMiniProgramAutomator:
     def wait_for_user_ready(self, message: str = ""):
         input(f"\n>>> {message}，完成后按回车继续...")
 
+    # ===================== 屏幕内容提取 =====================
+
     async def get_screen_nodes(self) -> list:
-        """获取屏幕所有节点，过滤掉状态栏/导航栏噪音"""
+        """通过无障碍树获取屏幕节点，过滤掉状态栏/导航栏噪音"""
         def _get():
             xml_content = self.device.dump_hierarchy()
             import xml.etree.ElementTree as ET
@@ -233,7 +429,6 @@ class WeChatMiniProgramAutomator:
                     "resource_id": node.get("resource-id", ""),
                 })
 
-            # 过滤噪音节点
             clean_nodes = [n for n in raw_nodes if not _is_noise_node(n)]
             return clean_nodes
         return await asyncio.to_thread(_get)
@@ -263,38 +458,89 @@ class WeChatMiniProgramAutomator:
             return nodes
         return await asyncio.to_thread(_get)
 
+    async def get_ocr_nodes(self) -> list:
+        """通过 OCR 截图识别获取屏幕文字节点"""
+        def _get():
+            if not self._ocr_initialized:
+                self._init_ocr()
+            if not self._ocr_engine:
+                return []
+
+            # 截图
+            self._screenshot_count += 1
+            ts = datetime.now().strftime("%H%M%S")
+            image_path = f"{SCREENSHOT_DIR}/{self._screenshot_count:03d}_{ts}_ocr.png"
+            try:
+                self.device.screenshot(image_path)
+            except Exception as e:
+                logger.warning(f"OCR 截图失败: {e}")
+                return []
+
+            # OCR 识别
+            try:
+                raw_nodes = self._ocr_engine.recognize(image_path)
+                logger.info(f"OCR 识别到 {len(raw_nodes)} 个文本块")
+                for n in raw_nodes:
+                    logger.debug(f"  OCR: '{n['display'][:60]}' conf={n.get('confidence', 0):.2f} bounds={n['bounds_str']}")
+
+                # 过滤噪音
+                clean_nodes = [n for n in raw_nodes if not _is_noise_node(n)]
+                logger.info(f"OCR 过滤后剩余 {len(clean_nodes)} 个有效节点")
+                return clean_nodes
+            except Exception as e:
+                logger.warning(f"OCR 识别失败: {e}")
+                return []
+
+        return await asyncio.to_thread(_get)
+
     async def extract_questions(self) -> List[Question]:
-        """从当前屏幕提取题目"""
+        """从当前屏幕提取题目（先尝试无障碍树，失败则回退到 OCR）"""
         await self.screenshot("extract")
 
+        # 策略1：通过无障碍树提取
         nodes = await self.get_screen_nodes()
+        source = "无障碍树"
+
+        # 如果无障碍树没有有效节点，尝试 OCR
         if not nodes:
-            logger.warning("过滤后没有有效文本节点")
-            # 显示原始节点帮助调试
+            logger.info("无障碍树未提取到有效内容（可能是 WebView 渲染），尝试 OCR 识别...")
+            nodes = await self.get_ocr_nodes()
+            source = "OCR"
+
+        if not nodes:
+            logger.warning("OCR 也未能提取到有效内容")
+            # 显示原始无障碍树节点帮助调试
             raw_nodes = await self.get_all_nodes_raw()
-            logger.info(f"原始节点（共 {len(raw_nodes)} 个）:")
+            logger.info(f"原始无障碍节点（共 {len(raw_nodes)} 个）:")
             for n in raw_nodes:
                 logger.info(f"  '{n['display'][:60]}' bounds={n['bounds_str']}")
+
+            # 最后回退：手动输入
+            logger.warning("自动提取失败！请手动输入题目")
+            question = await self._manual_input_question()
+            if question:
+                return [question]
             return []
 
         full_text = "\n".join([n["display"] for n in nodes])
-        logger.debug(f"过滤后屏幕文本:\n{full_text[:500]}")
+        logger.debug(f"[{source}] 过滤后屏幕文本:\n{full_text[:500]}")
 
-        # 策略1：从节点中解析单题
+        # 从节点中解析题目
         question = self._parse_single_question(nodes)
-        if question and question.text and len(question.text) > 5:
-            logger.info(f"提取到题目: {question.text[:60]}")
+        if question and question.text and len(question.text) > 3:
+            logger.info(f"[{source}] 提取到题目: {question.text[:80]}")
             for letter, opt in question.options:
                 logger.info(f"  选项 {letter}: {opt[:40]}")
             return [question]
 
-        # 策略2：从文本中按题号分割
+        # 尝试按题号分割多题
         questions = self._parse_multiple_from_text(full_text)
         if questions:
+            logger.info(f"[{source}] 提取到 {len(questions)} 道题")
             return questions
 
-        # 策略3：手动输入
-        logger.warning("自动提取题目失败！")
+        # 回退：手动输入
+        logger.warning(f"[{source}] 自动解析题目失败！")
         logger.info(f"屏幕文本:\n{full_text[:800]}")
         question = await self._manual_input_question()
         if question:
@@ -304,9 +550,9 @@ class WeChatMiniProgramAutomator:
 
     async def _manual_input_question(self) -> Optional[Question]:
         """手动输入题目（当自动提取失败时）"""
-        print("\n" + "="*50)
+        print("\n" + "=" * 50)
         print("自动提取题目失败，请手动输入")
-        print("="*50)
+        print("=" * 50)
         print("请把当前屏幕上的题目和选项输入（或粘贴）到这里")
         print("格式示例：")
         print("  下列哪个是Python的特点")
@@ -315,7 +561,7 @@ class WeChatMiniProgramAutomator:
         print("  C. 汇编语言")
         print("  D. 机器语言")
         print("输入完成后按回车（多行请用 | 分隔或直接粘贴）")
-        print("-"*50)
+        print("-" * 50)
 
         try:
             raw = input("题目内容> ").strip()
@@ -342,6 +588,8 @@ class WeChatMiniProgramAutomator:
         except Exception:
             return None
 
+    # ===================== 题目解析 =====================
+
     def _parse_single_question(self, nodes: list) -> Optional[Question]:
         """从过滤后的节点中解析单道题目"""
         question_candidates = []
@@ -352,30 +600,42 @@ class WeChatMiniProgramAutomator:
             if not text:
                 continue
 
-            # 检查是否是选项
+            # 检查是否是选项（A. xxx / A、xxx / A) xxx）
             opt_match = re.match(r"^([A-D])\s*[.、）)\]]\s*(.+)", text)
             if opt_match:
                 option_candidates.append((opt_match.group(1), opt_match.group(2).strip(), node))
                 continue
 
-            # 排除太短的（可能是图标 label）
-            if len(text) < 4:
+            # 检查是否是选项（只有字母 A/B/C/D）
+            if re.match(r"^([A-D])$", text) and len(text) == 1:
+                option_candidates.append((text, "", node))
+                continue
+
+            # 排除太短的
+            if len(text) < 3:
                 continue
 
             question_candidates.append((text, node))
 
         # 有选项的情况
         if option_candidates:
-            option_candidates.sort(key=lambda x: x[0])
-            options = [(oc[0], oc[1]) for oc in option_candidates]
+            # 去重并排序
+            seen_letters = set()
+            unique_opts = []
+            for oc in option_candidates:
+                if oc[0] not in seen_letters:
+                    seen_letters.add(oc[0])
+                    unique_opts.append(oc)
+            unique_opts.sort(key=lambda x: x[0])
+            options = [(oc[0], oc[1]) for oc in unique_opts]
 
             # 找题目：选项上方最长的文本
-            first_opt_y = option_candidates[0][2]["bounds"][1] if option_candidates[0][2]["bounds"] else 9999
+            first_opt_y = unique_opts[0][2]["bounds"][1] if unique_opts[0][2].get("bounds") else 9999
 
             best_q = ""
             for text, node in question_candidates:
-                ny = node["bounds"][1] if node["bounds"] else 9999
-                if ny < first_opt_y and len(text) > len(best_q):
+                ny = node["bounds"][1] if node.get("bounds") else 9999
+                if ny <= first_opt_y and len(text) > len(best_q):
                     best_q = text
 
             if not best_q and question_candidates:
@@ -432,10 +692,25 @@ class WeChatMiniProgramAutomator:
                 opts.append((letter, opt))
         return opts
 
+    # ===================== 答案选择 =====================
+
     async def select_answer(self, question: Question, answer_letters: List[str]) -> bool:
+        """选择答案（先尝试无障碍树，失败则用 OCR 定位）"""
         if not answer_letters:
             return False
+
+        # 先尝试无障碍树获取节点
         nodes = await self.get_screen_nodes()
+
+        # 如果无障碍树没有节点，用 OCR
+        if not nodes:
+            logger.info("无障碍树无节点，使用 OCR 定位选项...")
+            nodes = await self.get_ocr_nodes()
+
+        if not nodes:
+            logger.error("无法获取屏幕节点，选择答案失败")
+            return False
+
         success = 0
         for letter in answer_letters:
             clicked = await asyncio.to_thread(self._click_option, nodes, letter, question)
@@ -443,8 +718,16 @@ class WeChatMiniProgramAutomator:
                 success += 1
                 logger.info(f"已选择选项 {letter}")
             else:
-                logger.warning(f"选项 {letter} 点击失败")
+                logger.warning(f"选项 {letter} 点击失败，尝试坐标点击...")
+                # 最后回退：坐标比例点击
+                clicked = await asyncio.to_thread(self._click_by_position, letter, question)
+                if clicked:
+                    success += 1
+                    logger.info(f"已通过坐标选择选项 {letter}")
+                else:
+                    logger.error(f"选项 {letter} 所有策略均失败")
             await asyncio.sleep(0.5)
+
         await self.screenshot(f"select_{''.join(answer_letters)}")
         return success > 0
 
@@ -453,10 +736,10 @@ class WeChatMiniProgramAutomator:
         # 策略1：精确匹配字母
         for node in nodes:
             text = node["display"].strip()
-            if text == letter and node["bounds"]:
+            if text == letter and node.get("bounds"):
                 self.device.click(*node["bounds"])
                 return True
-            if re.match(rf"^{letter}\s*[.、）)\]]", text) and node["bounds"]:
+            if re.match(rf"^{letter}\s*[.、）)\]]", text) and node.get("bounds"):
                 self.device.click(*node["bounds"])
                 return True
 
@@ -466,19 +749,22 @@ class WeChatMiniProgramAutomator:
                 continue
             for node in nodes:
                 t = node["display"].strip()
-                if opt_t and (opt_t in t or t in opt_t) and node["bounds"]:
+                if opt_t and (opt_t in t or t in opt_t) and node.get("bounds"):
                     self.device.click(*node["bounds"])
                     return True
 
         # 策略3：可点击元素按顺序
-        clickables = [n for n in nodes if n["clickable"] and n["bounds"]]
+        clickables = [n for n in nodes if n.get("clickable") and n.get("bounds")]
         if len(clickables) >= len(question.options):
             idx = ord(letter) - 65
             if idx < len(clickables):
                 self.device.click(*clickables[idx]["bounds"])
                 return True
 
-        # 策略4：坐标比例
+        return False
+
+    def _click_by_position(self, letter: str, question: Question) -> bool:
+        """按坐标比例点击选项（最后回退策略）"""
         try:
             info = self.device.info
             sw, sh = info["displayWidth"], info["displayHeight"]
@@ -504,7 +790,7 @@ class WeChatMiniProgramAutomator:
 
     async def fill_answer(self, question: Question, answer_text: str):
         def _fill():
-            edit = self.device(resourceClass="android.widget.EditText")
+            edit = self.device(className="android.widget.EditText")
             if edit.exists:
                 edit.set_text(answer_text)
                 logger.info(f"已填写: {answer_text}")
@@ -559,29 +845,56 @@ class WeChatMiniProgramAutomator:
             return False
         return await asyncio.to_thread(_click)
 
+    async def scroll_down(self):
+        """向下滑动屏幕"""
+        def _scroll():
+            try:
+                info = self.device.info
+                sw, sh = info["displayWidth"], info["displayHeight"]
+                # 从屏幕 70% 处滑到 30% 处
+                x1 = int(sw * 0.5)
+                y1 = int(sh * 0.7)
+                x2 = int(sw * 0.5)
+                y2 = int(sh * 0.3)
+                self.device.swipe(x1, y1, x2, y2, duration=0.5)
+                logger.debug("已向下滑动")
+            except Exception as e:
+                logger.warning(f"滑动失败: {e}")
+        await asyncio.to_thread(_scroll)
+
+    # ===================== 主答题循环 =====================
+
     async def run_auto_answer(self):
         """主答题循环"""
         results: List[AnswerResult] = []
         q_count = 0
         max_q = 200
         fail_streak = 0
+        max_fail_streak = 5
 
         while q_count < max_q:
             q_count += 1
-            logger.info(f"\n{'='*60}")
+            logger.info(f"\n{'=' * 60}")
             logger.info(f"第 {q_count} 题")
 
-            questions = await self.extract_questions()
+            try:
+                questions = await self.extract_questions()
+            except Exception as e:
+                logger.error(f"提取题目异常: {e}")
+                questions = []
+
             if not questions:
                 fail_streak += 1
                 logger.warning(f"未检测到题目（连续 {fail_streak} 次）")
-                if fail_streak >= 3:
-                    logger.error("连续失败，停止")
+                if fail_streak >= max_fail_streak:
+                    logger.error(f"连续 {max_fail_streak} 次未检测到题目，停止答题")
                     break
+                # 尝试点击"查看结果"等按钮
                 if await self.click_view_result():
                     fail_streak = 0
                     continue
-                await asyncio.to_thread(self.device.scroll, True)
+                # 尝试滑动后重试
+                await self.scroll_down()
                 await asyncio.sleep(1)
                 continue
 
@@ -591,12 +904,20 @@ class WeChatMiniProgramAutomator:
             logger.info(f"题目: {question.text[:80]}")
             logger.info(f"题型: {question.question_type}, 选项数: {len(question.options)}")
 
-            # 如果没有选项也不是判断/填空，提示用户
+            # 如果没有选项也不是判断/填空，提示
             if not question.options and question.question_type == "single":
-                logger.warning("未检测到选项！可能是小程序 WebView 内容无法提取")
-                logger.info("请使用 --inspect 模式查看屏幕结构，或手动输入题目")
+                logger.warning("未检测到选项！可能需要 OCR 识别或手动输入")
 
-            result = await self.ds_client.answer_question(question)
+            # 向 DeepSeek 发送题目获取答案
+            try:
+                result = await self.ds_client.answer_question(question)
+            except Exception as e:
+                logger.error(f"DeepSeek 答题异常: {e}")
+                result = AnswerResult(
+                    question=question, answer_letters=[], raw_response="",
+                    success=False, error=f"DeepSeek 异常: {e}",
+                )
+
             results.append(result)
 
             if result.success and result.answer_letters:
@@ -605,20 +926,25 @@ class WeChatMiniProgramAutomator:
                 else:
                     await self.select_answer(question, result.answer_letters)
                 if result.reasoning:
-                    logger.info(f"解析: {result.reasoning[:120]}")
+                    logger.info(f"解析: {result.reasoning[:150]}")
             else:
                 logger.warning(f"第 {q_count} 题未获取答案: {result.error}")
+                logger.info("跳过此题，继续下一题")
 
             await asyncio.sleep(self.config.question_delay)
 
+            # 点击下一题
             if not await self.click_next_question():
                 if await self.click_view_result():
                     await asyncio.sleep(1)
                     if not await self.click_next_question():
+                        logger.info("无法找到下一题按钮，可能答题已完成")
                         break
                 else:
+                    logger.info("无法找到下一题按钮，可能答题已完成")
                     break
 
+        # 提交
         if self.config.confirm_before_submit:
             await self.screenshot("before_submit")
             self.wait_for_user_ready("答题完成，请检查")
@@ -628,21 +954,33 @@ class WeChatMiniProgramAutomator:
         return results
 
     async def inspect_screen(self):
-        """调试模式：输出所有节点"""
+        """调试模式：输出所有节点信息"""
         await self.screenshot("inspect")
+
+        # 无障碍树
         raw_nodes = await self.get_all_nodes_raw()
         filtered = await self.get_screen_nodes()
 
-        logger.info(f"=== 屏幕检查（原始 {len(raw_nodes)} 个节点）===")
+        logger.info(f"=== 无障碍树（原始 {len(raw_nodes)} 个节点）===")
         for i, n in enumerate(raw_nodes):
             noise = " [噪音]" if _is_noise_node(n) else ""
             logger.info(f"  [{i}] '{n['display'][:60]}'{noise} bounds={n['bounds_str']} click={n['clickable']}")
 
-        logger.info(f"\n=== 过滤后 {len(filtered)} 个有效节点 ===")
+        logger.info(f"\n=== 无障碍树过滤后 {len(filtered)} 个有效节点 ===")
         for n in filtered:
             logger.info(f"  '{n['display'][:60]}' bounds={n['bounds_str']} click={n['clickable']}")
 
-        question = self._parse_single_question(filtered)
+        # OCR
+        logger.info(f"\n=== OCR 识别 ===")
+        ocr_nodes = await self.get_ocr_nodes()
+        logger.info(f"OCR 识别到 {len(ocr_nodes)} 个有效节点:")
+        for n in ocr_nodes:
+            conf = n.get("confidence", 0)
+            logger.info(f"  '{n['display'][:60]}' conf={conf:.2f} bounds={n['bounds_str']}")
+
+        # 尝试解析题目
+        all_nodes = filtered if filtered else ocr_nodes
+        question = self._parse_single_question(all_nodes)
         if question:
             logger.info(f"\n解析题目: {question.text}")
             for l, t in question.options:
@@ -650,7 +988,14 @@ class WeChatMiniProgramAutomator:
         else:
             logger.info("\n未能解析到题目")
 
+        # 手动输入回退
+        if not question:
+            q = await self._manual_input_question()
+            if q:
+                logger.info(f"手动输入题目: {q.text}")
+
     async def close(self):
+        """释放资源"""
         if self.ds_client:
             await self.ds_client.close()
         logger.info("资源已释放")
