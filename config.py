@@ -1,6 +1,7 @@
 """
 云学帮自动刷题脚本 - 配置模块
-使用 DeepSeek 网页版获取答案，无需 API Key
+云学帮为微信小程序，通过安卓模拟器运行微信 + uiautomator2 自动化操作
+DeepSeek 网页版获取答案，无需 API Key
 """
 
 import os
@@ -30,37 +31,14 @@ class DeepSeekWebConfig:
 
 
 @dataclass
-class WebAutomationConfig:
-    """云学帮 Web 端自动化配置（Playwright）"""
-    # 云学帮平台网址
-    platform_url: str = "https://www.yunxuebang.com"
-    # 是否使用无头模式（建议 False，方便手动登录）
-    headless: bool = False
-    # 浏览器类型: chromium / firefox / webkit
-    browser_type: str = "chromium"
-    # 视口宽度
-    viewport_width: int = 1280
-    # 视口高度
-    viewport_height: int = 800
-    # 用户数据目录（保持登录状态，可选）
-    user_data_dir: Optional[str] = None
-    # 每道题之间的延迟（秒），避免过快被检测
-    question_delay: float = 2.0
-    # 是否在提交前等待用户确认
-    confirm_before_submit: bool = True
-    # 是否自动提交（False 则只选题不提交）
-    auto_submit: bool = False
-
-
-@dataclass
-class AndroidAutomationConfig:
-    """云学帮 Android 端自动化配置（uiautomator2）"""
+class WeChatMiniProgramConfig:
+    """微信小程序自动化配置（uiautomator2）"""
     # 设备序列号（通过 adb devices 查看，留空则自动选择第一个设备）
     device_serial: str = ""
-    # 云学帮包名
-    app_package: str = "com.huanYu.js.yunxuebang"
-    # 启动 Activity
-    app_activity: str = ""
+    # 微信包名
+    wechat_package: str = "com.tencent.mm"
+    # 云学帮小程序名称（用于在微信中搜索）
+    mini_program_name: str = "云学帮"
     # 每道题之间的延迟（秒）
     question_delay: float = 2.0
     # 是否在提交前等待用户确认
@@ -69,22 +47,19 @@ class AndroidAutomationConfig:
     auto_submit: bool = False
     # UI 操作等待超时（秒）
     ui_timeout: float = 10.0
+    # 是否自动打开小程序（False 则等待用户手动打开）
+    auto_open_mini_program: bool = False
 
 
 @dataclass
 class AppConfig:
     """全局配置"""
     deepseek: DeepSeekWebConfig = field(default_factory=DeepSeekWebConfig)
-    web: WebAutomationConfig = field(default_factory=WebAutomationConfig)
-    android: AndroidAutomationConfig = field(default_factory=AndroidAutomationConfig)
-    # 运行模式: web / android
-    mode: str = "web"
+    wechat: WeChatMiniProgramConfig = field(default_factory=WeChatMiniProgramConfig)
     # 是否开启调试日志
     debug: bool = False
     # 日志文件路径
     log_file: str = "yunxuebang_auto.log"
-    # 是否自动提交（False 则只选题不提交）
-    auto_submit: bool = False
     # 答题正确率统计输出文件
     stats_file: str = "answer_stats.json"
 
@@ -108,15 +83,15 @@ def load_config_from_env() -> AppConfig:
     if env_thinking:
         config.deepseek.use_deep_thinking = env_thinking.lower() == "true"
 
-    # 云学帮平台 URL
-    env_url = os.getenv("YUNXUEBANG_URL")
-    if env_url:
-        config.web.platform_url = env_url
+    # 小程序名称
+    env_mp_name = os.getenv("MINI_PROGRAM_NAME")
+    if env_mp_name:
+        config.wechat.mini_program_name = env_mp_name
 
-    # 运行模式
-    env_mode = os.getenv("AUTO_MODE")
-    if env_mode:
-        config.mode = env_mode
+    # 设备序列号
+    env_device = os.getenv("ANDROID_DEVICE")
+    if env_device:
+        config.wechat.device_serial = env_device
 
     # 调试模式
     config.debug = os.getenv("DEBUG", "false").lower() == "true"

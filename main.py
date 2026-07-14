@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
 云学帮自动刷题脚本 - 主程序
-通过 DeepSeek 网页版自动回答云学帮平台上的题目，无需 API Key
-
-支持两种模式：
-  1. web     - Playwright 浏览器自动化（DeepSeek + 云学帮 同一浏览器双标签页）
-  2. android - 手机操作云学帮 APP + 电脑浏览器操作 DeepSeek
+云学帮为微信小程序，通过安卓模拟器运行微信操作
+DeepSeek 网页版获取答案，无需 API Key
 
 用法:
-  python main.py                     # 默认 Web 模式
-  python main.py --mode android      # Android 模式
+  python main.py                     # 启动（自动连接设备 + 打开 DeepSeek）
   python main.py --thinking          # 开启 DeepSeek 深度思考
-  python main.py --inspect           # 页面检查模式（调试用）
+  python main.py --inspect           # 屏幕检查模式（调试用）
   python main.py --auto-submit       # 自动提交（不等待确认）
+  python main.py --device SERIAL     # 指定设备序列号
+  python main.py --debug             # 开启调试日志
 """
 
 import argparse
@@ -26,7 +24,6 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import AppConfig, load_config_from_env
-from models import AnswerResult
 
 
 def setup_logging(config: AppConfig):
@@ -54,11 +51,11 @@ def print_banner():
     """打印启动横幅"""
     banner = """
 +----------------------------------------------------------+
-|          云学帮自动刷题脚本 (DeepSeek 网页版驱动)          |
+|       云学帮自动刷题脚本 (DeepSeek + 微信小程序)           |
 |                                                          |
 |  AI 引擎: DeepSeek 网页版 (chat.deepseek.com)             |
-|  平台: 云学帮                                             |
-|  引擎: Playwright (Web) / uiautomator2 (Android)         |
+|  平台: 云学帮 (微信小程序)                                 |
+|  引擎: Playwright (DeepSeek) + uiautomator2 (微信)       |
 |  特点: 无需 API Key，直接使用网页版对话                    |
 +----------------------------------------------------------+
 """
@@ -106,39 +103,37 @@ def print_results_summary(results: list, stats_file: str):
         print(f"保存统计失败: {e}")
 
 
-async def run_web_mode(config: AppConfig, args):
-    """Web 模式：同一浏览器中 DeepSeek + 云学帮 双标签页"""
-    from web_automator import WebAutomator
+async def run(config: AppConfig, args):
+    """主运行流程"""
+    from wechat_automator import WeChatMiniProgramAutomator
 
-    automator = WebAutomator(config.web, config.deepseek)
+    automator = WeChatMiniProgramAutomator(config.wechat, config.deepseek)
 
     try:
-        # 1. 启动浏览器
+        # 1. 连接设备 + 初始化 DeepSeek 浏览器
         await automator.start()
 
-        # 2. 初始化 DeepSeek 标签页
-        await automator.init_deepseek()
-
-        # 3. 用户登录 DeepSeek
+        # 2. 用户登录 DeepSeek
         logger = logging.getLogger(__name__)
         logger.info("正在打开 DeepSeek 网页...")
-        ds_ready = await automator.ds_client.navigate_and_login()
-        if not ds_ready:
-            logger.error("DeepSeek 未就绪，请检查网络和登录状态")
-            return
+        await automator.init_deepseek_login()
 
-        # 4. 导航到云学帮
-        await automator.navigate(config.web.platform_url)
+        # 3. 启动微信
+        await automator.open_wechat()
 
-        # 5. 等待用户登录云学帮并进入答题页面
-        await automator.wait_for_user_ready(
-            "请在云学帮标签页登录并进入答题/考试页面"
+        # 4. 打开云学帮小程序（或等待用户手动打开）
+        if config.wechat.auto_open_mini_program:
+            await automator.open_mini_program()
+
+        # 5. 等待用户在微信中进入答题页面
+        automator.wait_for_user_ready(
+            "请在微信中打开云学帮小程序，进入答题/考试页面"
         )
 
         # 检查模式
         if args.inspect:
-            await automator.inspect_page()
-            await automator.wait_for_user_ready("检查完成")
+            await automator.inspect_screen()
+            automator.wait_for_user_ready("检查完成")
             return
 
         # 6. 执行自动答题
@@ -151,85 +146,41 @@ async def run_web_mode(config: AppConfig, args):
         await automator.close()
 
 
-async def run_android_mode(config: AppConfig, args):
-    """Android 模式：手机操作云学帮 + 电脑浏览器操作 DeepSeek"""
-    from android_automator import AndroidAutomator
-
-    automator = AndroidAutomator(config.android, config.deepseek)
-
-    try:
-        # 1. 连接设备 + 初始化 DeepSeek 浏览器
-        await automator.start()
-
-        # 2. 用户登录 DeepSeek
-        logger = logging.getLogger(__name__)
-        logger.info("正在打开 DeepSeek 网页...")
-        await automator.init_deepseek_login()
-
-        # 3. 等待用户在手机上进入答题页面
-        automator.wait_for_user_ready(
-            "请在手机上进入云学帮的答题/考试页面"
-        )
-
-        # 检查模式
-        if args.inspect:
-            await automator.inspect_screen()
-            automator.wait_for_user_ready("检查完成")
-            return
-
-        # 4. 执行自动答题
-        results = await automator.run_auto_answer()
-
-        if results:
-            print_results_summary(results, config.stats_file)
-
-    finally:
-        await automator.close()
-
-
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="云学帮自动刷题脚本 - DeepSeek 网页版驱动（无需 API Key）",
+        description="云学帮自动刷题脚本 - DeepSeek 网页版 + 微信小程序（无需 API Key）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  %(prog)s                          默认 Web 模式启动
-  %(prog)s --mode android           Android 模式（手机+电脑）
+  %(prog)s                          启动自动答题
   %(prog)s --thinking               开启 DeepSeek 深度思考模式
-  %(prog)s --inspect                检查页面/屏幕结构（调试用）
+  %(prog)s --inspect                检查屏幕结构（调试用）
   %(prog)s --auto-submit            自动提交，不等待确认
-  %(prog)s --url https://xxx.com    指定云学帮平台 URL
+  %(prog)s --device emulator-5554   指定设备序列号
   %(prog)s --delay 3.0              每题延迟 3 秒
+  %(prog)s --auto-open              自动搜索并打开云学帮小程序
+  %(prog)s --debug                  开启调试日志
 
 环境变量:
   DEEPSEEK_URL        DeepSeek 网页地址（默认 https://chat.deepseek.com/）
   DEEPSEEK_THINKING   是否开启深度思考 true/false
-  YUNXUEBANG_URL      云学帮平台 URL
-  AUTO_MODE           运行模式 web/android
+  MINI_PROGRAM_NAME   小程序名称（默认 云学帮）
+  ANDROID_DEVICE      设备序列号
   DEBUG               调试模式 true/false
 """,
     )
-    parser.add_argument(
-        "--mode", choices=["web", "android"], default="web",
-        help="运行模式: web (浏览器自动化) 或 android (手机+电脑)",
-    )
-    parser.add_argument("--url", help="云学帮平台 URL")
     parser.add_argument(
         "--thinking", action="store_true",
         help="开启 DeepSeek 深度思考模式（更准确但更慢）",
     )
     parser.add_argument(
         "--inspect", action="store_true",
-        help="检查模式：输出页面/屏幕结构，用于调试",
+        help="检查模式：输出屏幕 UI 结构，用于调试",
     )
     parser.add_argument(
         "--auto-submit", action="store_true",
         help="自动提交试卷，不等待用户确认",
-    )
-    parser.add_argument(
-        "--headless", action="store_true",
-        help="无头模式（不推荐，DeepSeek 需要手动登录）",
     )
     parser.add_argument(
         "--device", help="Android 设备序列号（通过 adb devices 查看）",
@@ -243,6 +194,14 @@ def parse_args():
         "--ds-url", default=None,
         help="DeepSeek 网页地址（默认 https://chat.deepseek.com/）",
     )
+    parser.add_argument(
+        "--mp-name", default=None,
+        help="小程序名称（默认 云学帮）",
+    )
+    parser.add_argument(
+        "--auto-open", action="store_true",
+        help="自动在微信中搜索并打开云学帮小程序",
+    )
     return parser.parse_args()
 
 
@@ -253,30 +212,24 @@ def main():
     config = load_config_from_env()
 
     # 应用命令行参数
-    if args.mode:
-        config.mode = args.mode
-    if args.url:
-        config.web.platform_url = args.url
     if args.thinking:
         config.deepseek.use_deep_thinking = True
     if args.auto_submit:
-        config.web.auto_submit = True
-        config.web.confirm_before_submit = False
-        config.android.auto_submit = True
-        config.android.confirm_before_submit = False
-    if args.headless:
-        config.web.headless = True
-        config.deepseek.headless = True
+        config.wechat.auto_submit = True
+        config.wechat.confirm_before_submit = False
     if args.device:
-        config.android.device_serial = args.device
+        config.wechat.device_serial = args.device
     if args.debug:
         config.debug = True
     if args.delay is not None:
-        config.web.question_delay = args.delay
-        config.android.question_delay = args.delay
+        config.wechat.question_delay = args.delay
         config.deepseek.question_interval = args.delay
     if args.ds_url:
         config.deepseek.url = args.ds_url
+    if args.mp_name:
+        config.wechat.mini_program_name = args.mp_name
+    if args.auto_open:
+        config.wechat.auto_open_mini_program = True
 
     # 配置日志
     setup_logging(config)
@@ -284,20 +237,14 @@ def main():
 
     print_banner()
 
-    logger.info(f"运行模式: {config.mode}")
     logger.info(f"DeepSeek URL: {config.deepseek.url}")
     logger.info(f"深度思考: {config.deepseek.use_deep_thinking}")
-    logger.info(f"云学帮 URL: {config.web.platform_url}")
-    logger.info(f"自动提交: {config.web.auto_submit if config.mode == 'web' else config.android.auto_submit}")
+    logger.info(f"小程序名称: {config.wechat.mini_program_name}")
+    logger.info(f"自动提交: {config.wechat.auto_submit}")
+    logger.info(f"自动打开小程序: {config.wechat.auto_open_mini_program}")
 
-    # 运行（两种模式都是 async）
-    if config.mode == "web":
-        asyncio.run(run_web_mode(config, args))
-    elif config.mode == "android":
-        asyncio.run(run_android_mode(config, args))
-    else:
-        logger.error(f"未知模式: {config.mode}")
-        sys.exit(1)
+    # 运行
+    asyncio.run(run(config, args))
 
 
 if __name__ == "__main__":

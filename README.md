@@ -1,18 +1,21 @@
-# 云学帮自动刷题脚本 (DeepSeek 网页版驱动)
+# 云学帮自动刷题脚本 (DeepSeek + 微信小程序)
 
-通过 **DeepSeek 网页版** 自动回答云学帮平台上的题目，**无需 API Key**，直接使用网页版对话。
+通过 **DeepSeek 网页版** 自动回答云学帮小程序上的题目，**无需 API Key**。
 
-## 功能特性
+## 工作原理
 
-- **无需 API Key**：直接使用 DeepSeek 网页版 (chat.deepseek.com)，不产生任何 API 费用
-- **双模式支持**：
-  - `web` 模式：同一浏览器中 DeepSeek + 云学帮 双标签页自动化
-  - `android` 模式：手机操作云学帮 APP + 电脑浏览器操作 DeepSeek
-- **多题型支持**：单选题、多选题、判断题、填空题
-- **智能识别**：自动识别页面上的题目和选项，支持多种常见前端框架
-- **深度思考**：可选开启 DeepSeek 深度思考模式，提高答题准确率
-- **安全机制**：默认不自动提交，需人工确认后才提交
-- **详细日志**：记录每道题的题目、答案、解析，并输出统计报告
+云学帮是微信小程序，没有网页版和独立 APP。脚本通过以下方式实现自动化：
+
+```
+电脑                                   安卓模拟器/手机
+├── 浏览器 (DeepSeek 网页版)           ├── 微信
+│   ├── 发送题目                       │   ├── 云学帮小程序
+│   └── 获取答案                       │   └── 答题界面
+└── uiautomator2 远程控制 ─────────────┘
+```
+
+- **电脑端**：Playwright 驱动浏览器打开 DeepSeek 网页版，发送题目获取答案
+- **手机端**：uiautomator2 控制微信中的云学帮小程序，提取题目、选择答案
 
 ## 快速开始
 
@@ -25,153 +28,116 @@ python --version
 # 安装依赖
 pip install -r requirements.txt
 
-# 安装 Playwright 浏览器
+# 安装 Playwright 浏览器（国内镜像加速）
+export PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 playwright install chromium
 ```
 
-### 2. 运行（无需任何 API Key 配置）
+### 2. 准备安卓模拟器
+
+推荐使用以下模拟器之一：
+- **雷电模拟器**（推荐）：默认端口 5555
+- **MuMu 模拟器**：默认端口 7555
+- **夜神模拟器**：默认端口 62001
+- **真机**：开启 USB 调试后用数据线连接
+
+在模拟器中安装微信并登录。
+
+```bash
+# 验证设备连接
+adb devices
+# 输出示例：
+# List of devices attached
+# emulator-5554    device
+```
+
+### 3. 运行
 
 ```bash
 python main.py
 ```
 
-脚本会自动打开浏览器并创建两个标签页：
-- 标签页 1：DeepSeek 网页版（需手动登录）
-- 标签页 2：云学帮平台（需手动登录并进入答题页面）
-
-### 3. 使用流程
+### 使用流程
 
 ```
 脚本启动
   |
   v
-浏览器打开 DeepSeek (chat.deepseek.com)
+电脑浏览器打开 DeepSeek → 用户手动登录
   |
   v
-用户手动登录 DeepSeek（手机号/邮箱/微信扫码）
+模拟器自动启动微信
   |
   v
-浏览器打开云学帮平台
-  |
-  v
-用户手动登录云学帮，进入答题/考试页面
+用户在微信中打开云学帮小程序，进入答题页面
   |
   v
 终端按回车开始自动答题
   |
   v
-+---> 从云学帮页面提取题目
++---> 从小程序界面提取题目
 |       |
 |       v
-|   切换到 DeepSeek 标签页，发送题目
+|   DeepSeek 获取答案
 |       |
 |       v
-|   等待 DeepSeek 生成回复
-|       |
-|       v
-|   提取答案并解析
-|       |
-|       v
-|   切回云学帮标签页，选择答案
+|   在小程序中选择答案
 |       |
 |       v
 |   下一题（循环）
 +-------+
   |
   v
-答题完成 -> 确认提交 -> 输出统计
+答题完成 → 确认提交 → 输出统计
 ```
 
 ## 常用参数
 
 | 参数 | 说明 |
 |---|---|
-| `--mode web/android` | 运行模式 |
 | `--thinking` | 开启 DeepSeek 深度思考模式（更准确但更慢） |
-| `--url URL` | 指定云学帮平台 URL |
-| `--ds-url URL` | 指定 DeepSeek 网页地址 |
 | `--auto-submit` | 自动提交，不等待确认 |
-| `--inspect` | 检查页面/屏幕结构（调试用） |
-| `--headless` | 无头模式（不推荐，需手动登录） |
+| `--device SERIAL` | 指定设备序列号（如 `emulator-5554`） |
+| `--auto-open` | 自动在微信中搜索并打开云学帮小程序 |
+| `--mp-name NAME` | 指定小程序名称（默认"云学帮"） |
 | `--delay SECONDS` | 每题之间的延迟秒数 |
+| `--inspect` | 检查屏幕 UI 结构（调试用） |
 | `--debug` | 开启调试日志 |
+| `--ds-url URL` | 指定 DeepSeek 网页地址 |
 
 ## 项目结构
 
 ```
-yunxuebang_auto/
+Yunxuebang-AutoAnswer/
 ├── main.py                  # 主程序入口
 ├── config.py                # 配置模块
 ├── models.py                # 共享数据结构 (Question/AnswerResult)
 ├── deepseek_web_client.py   # DeepSeek 网页版客户端 (Playwright)
-├── web_automator.py         # 云学帮 Web 端自动化 (Playwright)
-├── android_automator.py     # 云学帮 Android 端自动化 (uiautomator2)
+├── wechat_automator.py      # 微信小程序自动化 (uiautomator2)
 ├── requirements.txt         # Python 依赖
 └── README.md                # 说明文档
 ```
 
-## 两种模式详解
+## 常见模拟器连接方式
 
-### Web 模式（默认）
+| 模拟器 | adb 连接命令 |
+|---|---|
+| 雷电模拟器 | `adb connect 127.0.0.1:5555` |
+| MuMu 模拟器 | `adb connect 127.0.0.1:7555` |
+| 夜神模拟器 | `adb connect 127.0.0.1:62001` |
+| 逍遥模拟器 | `adb connect 127.0.0.1:21503` |
 
-同一浏览器中运行两个标签页：
-
-```
-浏览器
-├── 标签页 1: chat.deepseek.com  (DeepSeek 网页版)
-└── 标签页 2: 云学帮平台          (答题页面)
-```
-
-- 脚本自动在两个标签页之间切换
-- 从云学帮提取题目 → 切到 DeepSeek 发送 → 等待回复 → 切回云学帮选题
-
-```bash
-python main.py --mode web
-```
-
-### Android 模式
-
-电脑和手机协同工作：
-
-```
-电脑                          手机
-├── 浏览器 (DeepSeek)         ├── 云学帮 APP
-└── 脚本控制                   └── uiautomator2 控制
-```
-
-- 电脑端浏览器操作 DeepSeek 网页版获取答案
-- 手机端通过 uiautomator2 操作云学帮 APP
-
-```bash
-# 确保 adb 已连接设备
-adb devices
-
-python main.py --mode android
-```
-
-## DeepSeek 深度思考
-
-开启深度思考模式可获得更准确的答案（但响应更慢）：
-
-```bash
-python main.py --thinking
-```
-
-或通过环境变量：
-
-```bash
-export DEEPSEEK_THINKING=true
-```
+连接后用 `python main.py --device emulator-5554` 指定设备。
 
 ## 调试
 
-### 页面检查模式
+### 屏幕检查模式
+
+题目识别不出来时，用检查模式查看小程序的 UI 结构：
 
 ```bash
 python main.py --inspect
 ```
-
-输出页面上匹配到的元素及选择器，帮助定位题目识别问题。
 
 ### 开启调试日志
 
@@ -181,25 +147,21 @@ python main.py --debug
 
 日志同时输出到控制台和 `yunxuebang_auto.log` 文件。
 
-### 答题统计
-
-每次运行后，答题统计保存到 `answer_stats.json`，包含每道题的题目、答案、解析和成功/失败状态。
-
 ## 环境变量
 
 | 变量 | 说明 | 默认值 |
 |---|---|---|
 | `DEEPSEEK_URL` | DeepSeek 网页地址 | `https://chat.deepseek.com/` |
 | `DEEPSEEK_THINKING` | 是否开启深度思考 | `false` |
-| `YUNXUEBANG_URL` | 云学帮平台 URL | `https://www.yunxuebang.com` |
-| `AUTO_MODE` | 运行模式 | `web` |
+| `MINI_PROGRAM_NAME` | 小程序名称 | `云学帮` |
+| `ANDROID_DEVICE` | 设备序列号 | 自动选择 |
 | `DEBUG` | 调试模式 | `false` |
 
 ## 注意事项
 
 - **无需任何 API Key**，直接使用 DeepSeek 网页版
-- 首次运行需要手动在浏览器中登录 DeepSeek 和云学帮
-- 建议设置合理的延迟（`--delay`），避免过快被平台检测
-- 默认不自动提交试卷，需在终端按回车确认后才提交
-- DeepSeek 网页版有使用频率限制，如遇限流请增加延迟
+- 需要在模拟器中安装微信并登录
+- 首次运行需要手动登录 DeepSeek 和微信
+- 默认不自动提交试卷，需按回车确认
+- DeepSeek 网页版有频率限制，如遇限流请增加 `--delay`
 - 仅供参考学习使用，请遵守平台使用规范
