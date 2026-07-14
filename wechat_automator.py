@@ -2024,11 +2024,14 @@ class WeChatMiniProgramAutomator:
             logger.info(f"题目: {question.text[:80]}")
             logger.info(f"题型: {question.question_type}, 选项数: {len(question.options)}")
 
-            # 如果没有选项也不是判断/填空，提示
+            # 如果没有选项也不是判断/填空，提示并等待
             if not question.options and question.question_type == "single":
-                logger.warning("未检测到选项！可能需要 OCR 识别或手动输入")
+                logger.warning("未检测到选项！可能是 OCR 识别不完整")
+                logger.info("请检查屏幕上的选项是否完整识别")
+                # 仍然继续尝试发送给 DeepSeek（可能 AI 能根据题目内容推断）
 
             # 向 DeepSeek 发送题目获取答案
+            answered = False
             try:
                 result = await self.ds_client.answer_question(question)
             except Exception as e:
@@ -2041,22 +2044,34 @@ class WeChatMiniProgramAutomator:
             results.append(result)
 
             if result.success and result.answer_letters:
+                logger.info(f"AI 答案: {result.answer_letters}")
                 if question.question_type == "fill":
                     # 填空题：传入所有答案（answer_letters 是答案文本列表）
                     fill_ok = await self.fill_answer(question, result.answer_letters)
                     if not fill_ok:
                         logger.warning("填空题填写失败！等待用户确认...")
                         self.wait_for_user_ready("填空题填写失败，请手动填写后按回车继续")
+                    else:
+                        answered = True
                 else:
                     select_ok = await self.select_answer(question, result.answer_letters)
                     if not select_ok:
                         logger.warning("选项选择失败！等待用户确认...")
                         self.wait_for_user_ready("选项选择失败，请手动选择后按回车继续")
+                    else:
+                        answered = True
                 if result.reasoning:
                     logger.info(f"解析: {result.reasoning[:150]}")
             else:
                 logger.warning(f"第 {q_count} 题未获取答案: {result.error}")
-                logger.info("跳过此题，继续下一题")
+                logger.info(f"AI 原始回复: {result.raw_response[:200]}")
+                logger.info("请手动作答后按回车继续...")
+                self.wait_for_user_ready(f"第 {q_count} 题未能自动作答，请手动选择/填写答案后按回车继续")
+
+            # 确认已作答后才继续
+            if not answered:
+                # 用户可能已经手动作答了
+                logger.info("已等待用户手动作答，继续下一题")
 
             await asyncio.sleep(self.config.question_delay)
 
@@ -2085,23 +2100,19 @@ class WeChatMiniProgramAutomator:
 
             if not next_clicked:
                 logger.warning("多次重试后仍无法找到下一题按钮")
-                # 最后尝试：直接点击底部中央和右下角
+                # 最后尝试：点击右下角（">" 按钮通常在此位置）
                 def _last_resort():
                     try:
                         info = self.device.info
                         sw, sh = info["displayWidth"], info["displayHeight"]
-                        # 尝试底部中央
-                        self.device.click(int(sw * 0.5), int(sh * 0.92))
-                        time.sleep(1)
-                        # 尝试右下角
-                        self.device.click(int(sw * 0.9), int(sh * 0.9))
+                        # 只点击右下角（不点底部中央，避免误触提交等按钮）
+                        self.device.click(int(sw * 0.85), int(sh * 0.92))
                         time.sleep(1.5)
                         return True
                     except Exception:
                         return False
                 await asyncio.to_thread(_last_resort)
-                # 不再 break，继续尝试下一题
-                logger.info("已尝试点击底部区域，继续答题...")
+                logger.info("已尝试点击右下角区域，继续答题...")
 
         # 提交
         if self.config.confirm_before_submit:
