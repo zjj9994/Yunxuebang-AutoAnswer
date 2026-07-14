@@ -48,6 +48,8 @@ class WebAutomationConfig:
     question_delay: float = 2.0
     # 是否在提交前等待用户确认
     confirm_before_submit: bool = True
+    # 是否自动提交（False 则只选题不提交）
+    auto_submit: bool = False
 
 
 @dataclass
@@ -63,6 +65,8 @@ class AndroidAutomationConfig:
     question_delay: float = 2.0
     # 是否在提交前等待用户确认
     confirm_before_submit: bool = True
+    # 是否自动提交（False 则只选题不提交）
+    auto_submit: bool = False
     # UI 操作等待超时（秒）
     ui_timeout: float = 10.0
 
