@@ -77,6 +77,54 @@ def _is_status_bar_text(text: str) -> bool:
     return False
 
 
+# 题型标签（这些是 UI 标签，不是题目内容）
+QUESTION_TYPE_LABELS = {"判断题", "单选题", "多选题", "填空题", "单选", "多选", "判断", "填空"}
+
+# 题型标签正则（匹配 "单选题" "多选题" "判断题" "填空题" 等）
+QUESTION_TYPE_PATTERN = re.compile(r"^[单多判断填]+[选题]$")
+
+
+def _is_question_type_label(text: str) -> bool:
+    """判断文本是否是题型标签（如 '判断题' '单选题'）"""
+    return text.strip() in QUESTION_TYPE_LABELS
+
+
+def _is_page_indicator(text: str) -> bool:
+    """判断文本是否是页码指示器（如 '1/870' '2/100' '第1题'）"""
+    text = text.strip()
+    # 1/870, 2/100 等
+    if re.match(r"^\d+/\d+$", text):
+        return True
+    # 第1题, 第2题 等
+    if re.match(r"^第\s*\d+\s*题$", text):
+        return True
+    # 1/870 题
+    if re.match(r"^\d+/\d+\s*题$", text):
+        return True
+    # 题目数量提示
+    if re.match(r"^共\s*\d+\s*题", text):
+        return True
+    return False
+
+
+def _clean_question_text(text: str) -> str:
+    """清理题目文本，移除题型标签和页码指示器"""
+    lines = text.split("\n")
+    cleaned = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # 跳过题型标签
+        if _is_question_type_label(line):
+            continue
+        # 跳过页码指示器
+        if _is_page_indicator(line):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
 def _is_nav_bar_text(text: str) -> bool:
     """判断文本是否来自导航栏"""
     if text in NAV_BAR_KEYWORDS:
@@ -108,6 +156,14 @@ def _is_noise_node(node: dict) -> bool:
 
     # 按钮文字
     if _is_button_text(text):
+        return True
+
+    # 题型标签（判断题/单选题等，作为独立行时是 UI 标签）
+    if _is_question_type_label(text):
+        return True
+
+    # 页码指示器（1/870 等）
+    if _is_page_indicator(text):
         return True
 
     # 太短的文本（< 2 个字符，可能是图标 label）
@@ -620,10 +676,31 @@ class WeChatMiniProgramAutomator:
         # 第二步：按节点位置分析
         question_candidates = []
         option_candidates = []
+        judge_option_nodes = []  # 判断题选项（"正确"/"错误"）
+
+        # 先检测是否有题型标签（判断题/单选题等）
+        has_type_label = any(
+            _is_question_type_label(n["display"].strip()) for n in sorted_nodes
+        )
+        detected_type_from_label = None
+        for n in sorted_nodes:
+            t = n["display"].strip()
+            if t == "判断题":
+                detected_type_from_label = "judge"
+            elif t == "多选题":
+                detected_type_from_label = "multiple"
+            elif t == "填空题":
+                detected_type_from_label = "fill"
+            elif t == "单选题":
+                detected_type_from_label = "single"
 
         for node in sorted_nodes:
             text = node["display"].strip()
             if not text:
+                continue
+
+            # 跳过题型标签和页码指示器
+            if _is_question_type_label(text) or _is_page_indicator(text):
                 continue
 
             # 检查是否是选项（A. xxx / A、xxx / A) xxx / A.xxx）
@@ -643,11 +720,24 @@ class WeChatMiniProgramAutomator:
                 option_candidates.append((opt_match2.group(1), opt_match2.group(2).strip(), node))
                 continue
 
+            # 判断题选项检测：独立的 "正确" 或 "错误"
+            if detected_type_from_label == "judge" or has_type_label:
+                if text == "正确" or text == "对":
+                    judge_option_nodes.append(("A", "正确", node))
+                    continue
+                if text == "错误" or text == "错":
+                    judge_option_nodes.append(("B", "错误", node))
+                    continue
+
             # 排除太短的
             if len(text) < 3:
                 continue
 
             question_candidates.append((text, node))
+
+        # 合并判断题选项
+        if judge_option_nodes and not option_candidates:
+            option_candidates = judge_option_nodes
 
         # 有选项的情况
         if option_candidates:
@@ -674,19 +764,34 @@ class WeChatMiniProgramAutomator:
             if above_texts:
                 best_q = "".join(above_texts)
             elif question_candidates:
-                # 没有在选项上方的文本，取最长的
-                best_q = max(question_candidates, key=lambda x: len(x[0]))[0]
+                best_q = "".join([t for t, _ in question_candidates])
             else:
                 best_q = ""
 
-            qtype = self._detect_type(best_q, options)
+            # 清理题目文本
+            best_q = _clean_question_text(best_q)
+            qtype = detected_type_from_label or self._detect_type(best_q, options)
             return Question(index=0, text=best_q, options=options, question_type=qtype)
 
         # 无选项（判断题/填空题）- 合并所有候选文本
         if question_candidates:
-            # 合并所有文本块作为完整题目
             merged_text = "".join([t for t, _ in question_candidates])
-            qtype = self._detect_type(merged_text, [])
+            merged_text = _clean_question_text(merged_text)
+            qtype = detected_type_from_label or self._detect_type(merged_text, [])
+
+            # 判断题：检查文本中是否有 "正确" 和 "错误"
+            if qtype == "judge" and not _is_question_type_label(merged_text):
+                has_correct = "正确" in merged_text
+                has_wrong = "错误" in merged_text
+                if has_correct and has_wrong:
+                    # 移除 "正确" 和 "错误" 文本
+                    merged_text = re.sub(r"正确", "", merged_text)
+                    merged_text = re.sub(r"错误", "", merged_text)
+                    merged_text = merged_text.strip()
+                    return Question(index=0, text=merged_text,
+                                    options=[("A", "正确"), ("B", "错误")],
+                                    question_type="judge")
+
             return Question(index=0, text=merged_text, options=[], question_type=qtype)
 
         return None
@@ -695,6 +800,17 @@ class WeChatMiniProgramAutomator:
         """从合并的文本中解析题目（处理 OCR 分块合并后的文本）"""
         if not full_text or len(full_text) < 3:
             return None
+
+        # 先检测题型（在清理之前检测，因为 "判断题" 标签会告诉我们题型）
+        detected_type = None
+        if "判断题" in full_text:
+            detected_type = "judge"
+        elif "多选题" in full_text or "多选" in full_text:
+            detected_type = "multiple"
+        elif "填空题" in full_text:
+            detected_type = "fill"
+        elif "单选题" in full_text:
+            detected_type = "single"
 
         # 尝试提取选项
         options = self._extract_options_from_text(full_text)
@@ -714,14 +830,41 @@ class WeChatMiniProgramAutomator:
             if len(matches) >= 2:
                 options = [(m[0], m[1].strip()) for m in matches]
 
-        # 移除选项部分，剩余的是题目
+        # 判断题特殊处理：检测独立的 "正确" 和 "错误" 文本
+        if not options and detected_type == "judge":
+            has_correct = bool(re.search(r"(?<![不对])正确(?![答案])", full_text))
+            has_wrong = "错误" in full_text
+            if has_correct and has_wrong:
+                options = [("A", "正确"), ("B", "错误")]
+
+        # 如果还没检测到题型，根据选项推断
+        if not detected_type:
+            if options and len(options) >= 2:
+                opt_texts = [opt[1] for opt in options]
+                if "正确" in opt_texts and "错误" in opt_texts:
+                    detected_type = "judge"
+                else:
+                    detected_type = "single"
+            else:
+                detected_type = self._detect_type(full_text, options)
+
+        # 移除选项部分
         question_text = full_text
         for letter, opt in options:
-            # 移除各种格式的选项
             question_text = re.sub(
                 rf"{letter}\s*[.、）)\]]?\s*{re.escape(opt)}", "", question_text
             )
-        question_text = question_text.strip()
+        # 移除独立的 "正确" 和 "错误"（判断题选项）
+        if detected_type == "judge" and options:
+            for _, opt in options:
+                question_text = re.sub(rf"\b{re.escape(opt)}\b", "", question_text)
+                # 也处理行首行尾的情况
+                lines = question_text.split("\n")
+                lines = [l for l in lines if l.strip() != opt]
+                question_text = "\n".join(lines)
+
+        # 清理题型标签和页码指示器
+        question_text = _clean_question_text(question_text)
 
         # 清理多余换行和空格
         question_text = re.sub(r"\n{2,}", "\n", question_text).strip()
@@ -729,8 +872,7 @@ class WeChatMiniProgramAutomator:
         if not question_text or len(question_text) < 3:
             return None
 
-        qtype = self._detect_type(question_text, options)
-        return Question(index=0, text=question_text, options=options, question_type=qtype)
+        return Question(index=0, text=question_text, options=options, question_type=detected_type)
 
     def _parse_multiple_from_text(self, full_text: str) -> List[Question]:
         """按题号分割多题"""
