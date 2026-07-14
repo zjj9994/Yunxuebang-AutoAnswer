@@ -161,13 +161,14 @@ def parse_response(response: str, question: Question) -> Tuple[List[str], str]:
         elif "错误" in head or "不正确" in head:
             answer_letters = ["B"]
 
-    # 策略4：最后回退 - 找到回复中第一个出现的选项字母
+    # 策略4：最后回退 - 找到回复中第一个独立出现的选项字母
     if not answer_letters and question.options:
         valid_letters = [opt[0] for opt in question.options]
-        for char in response.upper():
-            if char in valid_letters:
-                answer_letters = [char]
-                logger.debug(f"回退匹配到第一个有效字母: {char}")
+        # 只匹配独立的字母（前后不是字母），避免匹配到 "AI" 中的 A
+        for m in re.finditer(r'(?<![A-Za-z])([A-D])(?![A-Za-z])', response):
+            if m.group(1) in valid_letters:
+                answer_letters = [m.group(1)]
+                logger.debug(f"回退匹配到独立字母: {m.group(1)}")
                 break
 
     # 验证答案是否在有效选项范围内
