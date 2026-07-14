@@ -198,7 +198,7 @@ def _is_noise_node(node: dict) -> bool:
 
 
 class OCREngine:
-    """OCR 引擎封装，支持多种后端"""
+    """OCR 引擎封装，支持多种后端 + 图像预处理"""
 
     _instance = None
     _engine_name = None
@@ -226,16 +226,28 @@ class OCREngine:
         # 尝试 RapidOCR (轻量级)
         try:
             from rapidocr_onnxruntime import RapidOCR
-            # 降低 text_score 阈值以识别单个字母和数字
-            # 默认 0.5 太高，短文本（如 A/B/C/D/>）置信度通常较低
+            # 降低检测阈值以识别短文本、数字和符号
+            # text_score: 文本识别置信度 (默认 0.5 → 0.3)
+            # box_thresh: 检测框阈值 (默认 0.5 → 0.3)
+            # thresh: 二值化阈值 (默认 0.3 → 0.2)
+            # unclip_ratio: 检测框扩展比例 (默认 1.6 → 2.0)
+            kwargs = {
+                "text_score": 0.3,
+                "box_thresh": 0.3,
+                "thresh": 0.2,
+                "unclip_ratio": 2.0,
+            }
             try:
-                cls._ocr = RapidOCR(text_score=0.3)
+                cls._ocr = RapidOCR(**kwargs)
             except TypeError:
-                # 旧版本不支持 text_score 参数
-                cls._ocr = RapidOCR()
+                # 旧版本不支持部分参数
+                try:
+                    cls._ocr = RapidOCR(text_score=0.3)
+                except TypeError:
+                    cls._ocr = RapidOCR()
             cls._engine_name = "RapidOCR"
             cls._instance = cls()
-            logger.info("OCR 引擎: RapidOCR (text_score=0.3)")
+            logger.info(f"OCR 引擎: RapidOCR ({kwargs})")
             return cls._instance
         except ImportError:
             pass
@@ -263,30 +275,106 @@ class OCREngine:
         )
         return None
 
-    def recognize(self, image_path: str) -> list:
+    def _preprocess_image(self, image_path: str) -> str:
         """
-        识别图片中的文字，返回节点列表
-        每个节点: {text, bounds, confidence}
+        图像预处理：放大2倍 + 灰度化 + 增强对比度
+        返回预处理后的临时图片路径
         """
         try:
-            if self._engine_name == "PaddleOCR":
-                return self._recognize_paddle(image_path)
-            elif self._engine_name == "RapidOCR":
-                return self._recognize_rapid(image_path)
-            elif self._engine_name == "EasyOCR":
-                return self._recognize_easy(image_path)
-        except Exception as e:
-            logger.error(f"OCR 识别异常: {e}", exc_info=True)
-        return []
+            from PIL import Image, ImageEnhance, ImageFilter
+            import os
 
-    def _parse_box(self, box) -> dict:
-        """解析 OCR 检测框坐标，返回中心点和边界（兼容 numpy 类型）"""
+            img = Image.open(image_path)
+            w, h = img.size
+
+            # 放大 2 倍
+            img = img.resize((w * 2, h * 2), Image.LANCZOS)
+
+            # 转灰度
+            if img.mode != 'L':
+                img = img.convert('L')
+
+            # 增强对比度 1.5 倍
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(1.5)
+
+            # 轻微锐化
+            img = img.filter(ImageFilter.SHARPEN)
+
+            # 保存预处理图片
+            base, ext = os.path.splitext(image_path)
+            proc_path = f"{base}_proc{ext}"
+            img.save(proc_path)
+            return proc_path
+        except ImportError:
+            logger.debug("PIL 未安装，跳过图像预处理")
+            return image_path
+        except Exception as e:
+            logger.debug(f"图像预处理失败: {e}")
+            return image_path
+
+    def recognize(self, image_path: str) -> list:
+        """
+        识别图片中的文字（双次识别：原图 + 预处理图）
+        返回节点列表，每个节点: {text, bounds, confidence}
+        """
+        all_nodes = []
+
+        # 第一次：原图识别
+        try:
+            if self._engine_name == "PaddleOCR":
+                nodes1 = self._recognize_paddle(image_path)
+            elif self._engine_name == "RapidOCR":
+                nodes1 = self._recognize_rapid(image_path)
+            elif self._engine_name == "EasyOCR":
+                nodes1 = self._recognize_easy(image_path)
+            else:
+                nodes1 = []
+            all_nodes.extend(nodes1)
+        except Exception as e:
+            logger.error(f"原图 OCR 异常: {e}", exc_info=True)
+            nodes1 = []
+
+        # 第二次：预处理图识别（放大+增强对比度）
+        proc_path = self._preprocess_image(image_path)
+        if proc_path != image_path:
+            try:
+                if self._engine_name == "PaddleOCR":
+                    nodes2 = self._recognize_paddle(proc_path, scale=2)
+                elif self._engine_name == "RapidOCR":
+                    nodes2 = self._recognize_rapid(proc_path, scale=2)
+                elif self._engine_name == "EasyOCR":
+                    nodes2 = self._recognize_easy(proc_path, scale=2)
+                else:
+                    nodes2 = []
+
+                # 合并结果：去重（相同坐标的节点只保留一个）
+                existing_texts = {n["display"] for n in all_nodes}
+                for node in nodes2:
+                    if node["display"] not in existing_texts:
+                        all_nodes.append(node)
+                        existing_texts.add(node["display"])
+            except Exception as e:
+                logger.error(f"预处理图 OCR 异常: {e}", exc_info=True)
+            finally:
+                # 清理临时文件
+                try:
+                    import os
+                    os.remove(proc_path)
+                except Exception:
+                    pass
+
+        logger.info(f"OCR 双次识别合并结果: {len(all_nodes)} 个文本块")
+        return all_nodes
+
+    def _parse_box(self, box, scale: int = 1) -> dict:
+        """解析 OCR 检测框坐标，返回中心点和边界（兼容 numpy 类型，支持缩放）"""
         try:
             xs = [float(p[0]) for p in box]
             ys = [float(p[1]) for p in box]
-            cx = int(sum(xs) / 4)
-            cy = int(sum(ys) / 4)
-            x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+            cx = int(sum(xs) / 4 / scale)
+            cy = int(sum(ys) / 4 / scale)
+            x1, y1, x2, y2 = int(min(xs) / scale), int(min(ys) / scale), int(max(xs) / scale), int(max(ys) / scale)
             return {
                 "bounds": (cx, cy),
                 "bounds_str": f"[{x1},{y1}][{x2},{y2}]",
@@ -308,7 +396,7 @@ class OCREngine:
             "confidence": float(conf) if conf is not None else 0.0,
         }
 
-    def _recognize_paddle(self, image_path: str) -> list:
+    def _recognize_paddle(self, image_path: str, scale: int = 1) -> list:
         """PaddleOCR 识别"""
         result = self._ocr.ocr(image_path, cls=True)
         nodes = []
@@ -316,8 +404,8 @@ class OCREngine:
             return nodes
 
         for line in result[0]:
-            box = line[0]       # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
-            text = line[1][0]   # text
+            box = line[0]
+            text = line[1][0]
             try:
                 conf = float(line[1][1])
             except (ValueError, TypeError):
@@ -326,13 +414,13 @@ class OCREngine:
             if conf < 0.3 or not text.strip():
                 continue
 
-            box_info = self._parse_box(box)
+            box_info = self._parse_box(box, scale)
             if not box_info["bounds"]:
                 continue
             nodes.append(self._make_node(text, conf, box_info))
         return nodes
 
-    def _recognize_rapid(self, image_path: str) -> list:
+    def _recognize_rapid(self, image_path: str, scale: int = 1) -> list:
         """RapidOCR 识别"""
         result, elapse = self._ocr(image_path)
         nodes = []
@@ -340,9 +428,8 @@ class OCREngine:
             return nodes
 
         for item in result:
-            box = item[0]       # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            box = item[0]
             text = item[1]
-            # RapidOCR 返回 score 为字符串 '0.99'，需转换为 float
             try:
                 conf = float(item[2])
             except (ValueError, TypeError, IndexError):
@@ -351,13 +438,13 @@ class OCREngine:
             if conf < 0.3 or not text.strip():
                 continue
 
-            box_info = self._parse_box(box)
+            box_info = self._parse_box(box, scale)
             if not box_info["bounds"]:
                 continue
             nodes.append(self._make_node(text, conf, box_info))
         return nodes
 
-    def _recognize_easy(self, image_path: str) -> list:
+    def _recognize_easy(self, image_path: str, scale: int = 1) -> list:
         """EasyOCR 识别"""
         result = self._ocr.readtext(image_path)
         nodes = []
@@ -365,7 +452,7 @@ class OCREngine:
             return nodes
 
         for item in result:
-            box = item[0]       # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            box = item[0]
             text = item[1]
             try:
                 conf = float(item[2])
@@ -375,7 +462,7 @@ class OCREngine:
             if conf < 0.3 or not text.strip():
                 continue
 
-            box_info = self._parse_box(box)
+            box_info = self._parse_box(box, scale)
             if not box_info["bounds"]:
                 continue
             nodes.append(self._make_node(text, conf, box_info))
