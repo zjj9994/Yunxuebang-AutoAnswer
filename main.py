@@ -127,14 +127,14 @@ async def run(config: AppConfig, args):
             await automator.open_mini_program()
 
         # 5. 等待用户在微信中进入答题页面
-        automator.wait_for_user_ready(
+        await automator.wait_for_user_ready(
             "请在微信中打开云学帮小程序，进入答题/考试页面"
         )
 
         # 检查模式
         if args.inspect:
             await automator.inspect_screen()
-            automator.wait_for_user_ready("检查完成")
+            await automator.wait_for_user_ready("检查完成")
             return
 
         # 6. 执行自动答题

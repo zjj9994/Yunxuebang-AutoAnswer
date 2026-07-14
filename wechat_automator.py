@@ -606,8 +606,9 @@ class WeChatMiniProgramAutomator:
     async def init_deepseek_login(self):
         await self.ds_client.navigate_and_login()
 
-    def wait_for_user_ready(self, message: str = ""):
-        input(f"\n>>> {message}，完成后按回车继续...")
+    async def wait_for_user_ready(self, message: str = ""):
+        """等待用户按回车继续（异步，不阻塞事件循环）"""
+        await asyncio.to_thread(input, f"\n>>> {message}，完成后按回车继续...")
 
     # ===================== 屏幕内容提取 =====================
 
@@ -1442,9 +1443,12 @@ class WeChatMiniProgramAutomator:
                         return True
 
             # 策略4：按 OCR 节点 y 坐标顺序匹配
-            # 收集可能是选项的节点（排除状态栏、导航栏等）
+            # 收集可能是选项的节点（排除状态栏、导航栏、下一题按钮等）
             info = self.device.info
             sh = info["displayHeight"]
+
+            # 下一题按钮符号 - 不能作为选项
+            next_symbols_set = {">", "〉", "›", "→", "❯", "➤", "➜", "》", "﹥", "＞"}
 
             opt_like = []
             for node in raw_nodes:
@@ -1463,6 +1467,12 @@ class WeChatMiniProgramAutomator:
                     continue
                 # 排除题型标签
                 if _is_question_type_label(text):
+                    continue
+                # 排除下一题按钮符号（关键：防止 ">" 被误认为选项）
+                if text in next_symbols_set:
+                    continue
+                # 排除 "下一题" 等文字
+                if any(nt in text for nt in ["下一题", "下一页", "继续", "提交", "交卷"]):
                     continue
                 # A/B/C/D 开头 或 短文本（选项通常较短）
                 if re.match(r"^[A-D]", text) or len(text) <= 30:
@@ -1529,7 +1539,10 @@ class WeChatMiniProgramAutomator:
         return False
 
     def _click_by_position(self, letter: str, question: Question) -> bool:
-        """按坐标比例点击选项（最后回退策略）"""
+        """按坐标比例点击选项（最后回退策略）
+        注意：此方法仍会尝试点击，但不返回 True，因为无法验证是否命中。
+        调用方应提示用户手动确认。
+        """
         try:
             info = self.device.info
             sw, sh = info["displayWidth"], info["displayHeight"]
@@ -1545,8 +1558,10 @@ class WeChatMiniProgramAutomator:
             y = int(y_start + step * (idx + 0.5))
             x = int(sw * 0.5)
             self.device.click(x, y)
-            logger.info(f"坐标点击: ({x},{y}) [共{total}个选项, 第{idx+1}个]")
-            return True
+            logger.info(f"坐标点击（未验证）: ({x},{y}) [共{total}个选项, 第{idx+1}个]")
+            logger.warning("坐标点击无法验证是否命中正确选项，请用户确认")
+            # 不返回 True - 坐标点击不可靠，不能作为成功依据
+            return False
         except Exception as e:
             logger.error(f"坐标点击失败: {e}")
             return False
@@ -1602,6 +1617,7 @@ class WeChatMiniProgramAutomator:
             return True
 
         # 策略3：点击屏幕中间偏下区域（输入框常见位置），尝试唤起键盘
+        # 注意：此策略不可靠，不返回 True，让调用方提示用户手动确认
         def _fill_by_position():
             try:
                 info = self.device.info
@@ -1616,9 +1632,11 @@ class WeChatMiniProgramAutomator:
                         self.device.press("tab")
                         time.sleep(0.5)
                     self.device.send_keys(ans)
-                    logger.info(f"已填写第{i+1}空: {ans}")
+                    logger.info(f"已尝试填写第{i+1}空: {ans}")
                     time.sleep(0.5)
-                return True
+                # 不返回 True - 无法验证输入是否成功
+                logger.warning("坐标填写无法验证是否成功，请用户确认")
+                return False
             except Exception as e:
                 logger.warning(f"坐标填写失败: {e}")
                 return False
@@ -1826,24 +1844,8 @@ class WeChatMiniProgramAutomator:
         if result:
             return True
 
-        # 策略3：点击屏幕右下方区域（">" 通常在右下角）
-        def _click_bottom_right():
-            try:
-                info = self.device.info
-                sw, sh = info["displayWidth"], info["displayHeight"]
-                # 右下角区域
-                x = int(sw * 0.85)
-                y = int(sh * 0.85)
-                self.device.click(x, y)
-                logger.info(f"点击右下角区域: ({x},{y})")
-                time.sleep(1.5)
-                return True
-            except Exception:
-                return False
-        result = await asyncio.to_thread(_click_bottom_right)
-        if result:
-            return True
-
+        # 不再盲点击右下角 - 避免未作答就跳下一题
+        logger.warning("未找到下一题按钮（无障碍树和 OCR 均未匹配）")
         return False
 
     async def _click_next_by_ocr(self) -> bool:
@@ -1907,10 +1909,9 @@ class WeChatMiniProgramAutomator:
                         self.device.click(*bounds)
                         return True
 
-            # 策略2c：找屏幕右下方区域的 ">" 符号
+            # 策略2c：在右下角区域只找 ">" 类符号（不再点击任意短文本）
             info = self.device.info
             sw, sh = info["displayWidth"], info["displayHeight"]
-            right_area_nodes = []
             for node in raw_nodes:
                 text = node["display"].strip()
                 bounds = node.get("bounds")
@@ -1918,29 +1919,12 @@ class WeChatMiniProgramAutomator:
                     continue
                 # 在屏幕右半部分且下半部分
                 if bounds[0] > sw * 0.5 and bounds[1] > sh * 0.5:
-                    right_area_nodes.append(node)
+                    if text in next_symbols:
+                        logger.info(f"OCR 右下角找到下一题符号: '{text}' at {bounds}")
+                        self.device.click(*bounds)
+                        return True
 
-            # 在右下角区域找 ">" 类符号
-            for node in right_area_nodes:
-                text = node["display"].strip()
-                if text in next_symbols or len(text) <= 2:
-                    bounds = node.get("bounds")
-                    logger.info(f"OCR 右下角找到按钮: '{text}' at {bounds}")
-                    self.device.click(*bounds)
-                    return True
-
-            # 策略2d：右下角最靠右下方的节点
-            if right_area_nodes:
-                # 按 y 坐标排序，取最靠下的
-                right_area_nodes.sort(key=lambda n: n.get("bounds", (0, 0))[1], reverse=True)
-                node = right_area_nodes[0]
-                bounds = node.get("bounds")
-                if bounds:
-                    text = node["display"].strip()
-                    logger.info(f"OCR 点击右下角最下方节点: '{text[:20]}' at {bounds}")
-                    self.device.click(*bounds)
-                    return True
-
+            # 不再盲点击右下角任意节点 - 避免误触选项或其他 UI 元素
             return False
         return await asyncio.to_thread(_click)
 
@@ -2048,34 +2032,39 @@ class WeChatMiniProgramAutomator:
                 if question.question_type == "fill":
                     # 填空题：传入所有答案（answer_letters 是答案文本列表）
                     fill_ok = await self.fill_answer(question, result.answer_letters)
-                    if not fill_ok:
-                        logger.warning("填空题填写失败！等待用户确认...")
-                        self.wait_for_user_ready("填空题填写失败，请手动填写后按回车继续")
-                    else:
+                    if fill_ok:
                         answered = True
+                    else:
+                        logger.warning("填空题自动填写失败，需手动确认")
                 else:
                     select_ok = await self.select_answer(question, result.answer_letters)
-                    if not select_ok:
-                        logger.warning("选项选择失败！等待用户确认...")
-                        self.wait_for_user_ready("选项选择失败，请手动选择后按回车继续")
-                    else:
+                    if select_ok:
                         answered = True
+                    else:
+                        logger.warning("选项自动选择失败，需手动确认")
                 if result.reasoning:
                     logger.info(f"解析: {result.reasoning[:150]}")
             else:
                 logger.warning(f"第 {q_count} 题未获取答案: {result.error}")
                 logger.info(f"AI 原始回复: {result.raw_response[:200]}")
-                logger.info("请手动作答后按回车继续...")
-                self.wait_for_user_ready(f"第 {q_count} 题未能自动作答，请手动选择/填写答案后按回车继续")
 
-            # 确认已作答后才继续
+            # ===== 关键：未作答时绝不自动跳下一题 =====
             if not answered:
-                # 用户可能已经手动作答了
-                logger.info("已等待用户手动作答，继续下一题")
+                # 统一提示：手动作答 + 手动点击下一题
+                logger.warning(f"第 {q_count} 题未能自动作答，请手动完成以下操作：")
+                logger.warning("  1. 手动选择/填写答案")
+                logger.warning("  2. 手动点击 '>' 或'下一题'按钮进入下一题")
+                await self.wait_for_user_ready(
+                    f"第 {q_count} 题需手动作答并手动点击下一题，完成后按回车继续"
+                )
+                # 用户已手动跳到下一题，直接继续
+                await asyncio.sleep(0.5)
+                continue
 
+            # ===== 已作答：尝试自动点击下一题 =====
             await asyncio.sleep(self.config.question_delay)
+            await self.screenshot(f"q{q_count}_answered")
 
-            # 点击下一题 - 多次重试
             next_clicked = False
             for retry in range(3):
                 if retry > 0:
@@ -2086,38 +2075,22 @@ class WeChatMiniProgramAutomator:
                     next_clicked = True
                     break
 
-                # 尝试点击"查看结果"等按钮后重试
-                if await self.click_view_result():
-                    await asyncio.sleep(1)
-                    if await self.click_next_question():
-                        next_clicked = True
-                        break
-
                 # 尝试滑动后重试（按钮可能在屏幕下方）
                 if retry < 2:
                     await self.scroll_down()
                     await asyncio.sleep(1)
 
             if not next_clicked:
-                logger.warning("多次重试后仍无法找到下一题按钮")
-                # 最后尝试：点击右下角（">" 按钮通常在此位置）
-                def _last_resort():
-                    try:
-                        info = self.device.info
-                        sw, sh = info["displayWidth"], info["displayHeight"]
-                        # 只点击右下角（不点底部中央，避免误触提交等按钮）
-                        self.device.click(int(sw * 0.85), int(sh * 0.92))
-                        time.sleep(1.5)
-                        return True
-                    except Exception:
-                        return False
-                await asyncio.to_thread(_last_resort)
-                logger.info("已尝试点击右下角区域，继续答题...")
+                # 无法自动找到下一题按钮，请用户手动点击
+                logger.warning("无法自动找到下一题按钮")
+                await self.wait_for_user_ready(
+                    f"第 {q_count} 题已作答，请手动点击 '>' 或'下一题'按钮后按回车继续"
+                )
 
         # 提交
         if self.config.confirm_before_submit:
             await self.screenshot("before_submit")
-            self.wait_for_user_ready("答题完成，请检查")
+            await self.wait_for_user_ready("答题完成，请检查")
         if self.config.confirm_before_submit or self.config.auto_submit:
             await self.click_submit()
             await self.screenshot("after_submit")
