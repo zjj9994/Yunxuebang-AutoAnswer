@@ -1507,13 +1507,173 @@ class WeChatMiniProgramAutomator:
             return ((x1 + x2) // 2, (y1 + y2) // 2)
         return None
 
-    async def fill_answer(self, question: Question, answer_text: str):
-        def _fill():
-            edit = self.device(className="android.widget.EditText")
-            if edit.exists:
-                edit.set_text(answer_text)
-                logger.info(f"已填写: {answer_text}")
+    async def fill_answer(self, question: Question, answer_text: str) -> bool:
+        """填写填空题答案（支持多空、WebView OCR 定位）"""
+        # 支持多空答案（answer_letters 可能是 ["答案1", "答案2"]）
+        # 如果传入的是单个字符串，转为列表
+        if isinstance(answer_text, str):
+            answers = [answer_text]
+        elif isinstance(answer_text, list):
+            answers = answer_text
+        else:
+            answers = [str(answer_text)]
+
+        logger.info(f"填空题答案: {answers}")
+
+        # 策略1：通过无障碍树找输入框
+        def _fill_accessibility():
+            try:
+                edits = self.device(className="android.widget.EditText")
+                count = edits.count
+                if count > 0:
+                    for i, ans in enumerate(answers):
+                        if i < count:
+                            edits[i].click()
+                            time.sleep(0.3)
+                            edits[i].set_text(ans)
+                            logger.info(f"已填写第{i+1}空: {ans}")
+                            time.sleep(0.3)
+                    return True
+            except Exception as e:
+                logger.debug(f"无障碍树填写失败: {e}")
+            return False
+
+        result = await asyncio.to_thread(_fill_accessibility)
+        if result:
+            await self.screenshot("fill_done")
+            return True
+
+        # 策略2：WebView 模式 - OCR 定位输入框位置
+        logger.info("无障碍树未找到输入框，尝试 OCR 定位...")
+        result = await self._fill_by_ocr(answers)
+        if result:
+            await self.screenshot("fill_done")
+            return True
+
+        # 策略3：点击屏幕中间偏下区域（输入框常见位置），尝试唤起键盘
+        def _fill_by_position():
+            try:
+                info = self.device.info
+                sw, sh = info["displayWidth"], info["displayHeight"]
+                # 点击屏幕中间偏下
+                self.device.click(int(sw * 0.5), int(sh * 0.55))
+                time.sleep(1)
+                # 尝试输入
+                for i, ans in enumerate(answers):
+                    if i > 0:
+                        # 多空时按 Tab 键切换
+                        self.device.press("tab")
+                        time.sleep(0.5)
+                    self.device.send_keys(ans)
+                    logger.info(f"已填写第{i+1}空: {ans}")
+                    time.sleep(0.5)
                 return True
+            except Exception as e:
+                logger.warning(f"坐标填写失败: {e}")
+                return False
+
+        result = await asyncio.to_thread(_fill_by_position)
+        return result
+
+    async def _fill_by_ocr(self, answers: list) -> bool:
+        """用 OCR 定位输入框位置并填写"""
+        def _fill():
+            if not self._ocr_initialized:
+                self._init_ocr()
+            if not self._ocr_engine:
+                return False
+
+            # 截图
+            self._screenshot_count += 1
+            ts = datetime.now().strftime("%H%M%S")
+            image_path = f"{SCREENSHOT_DIR}/{self._screenshot_count:03d}_{ts}_fill.png"
+            try:
+                self.device.screenshot(image_path)
+            except Exception:
+                return False
+
+            # OCR 识别
+            try:
+                raw_nodes = self._ocr_engine.recognize(image_path)
+            except Exception:
+                return False
+
+            if not raw_nodes:
+                return False
+
+            info = self.device.info
+            sw, sh = info["displayWidth"], info["displayHeight"]
+
+            # 策略1：找输入框提示文字（如 "请输入答案" "请填写" 等）
+            input_hints = ["请输入", "请填写", "输入答案", "填写答案", "答案"]
+            for node in raw_nodes:
+                text = node["display"].strip()
+                bounds = node.get("bounds")
+                if not bounds:
+                    continue
+                for hint in input_hints:
+                    if hint in text:
+                        # 点击提示文字位置（输入框通常就在提示文字处或下方）
+                        click_x = bounds[0]
+                        click_y = bounds[1] + 20  # 稍微偏下
+                        logger.info(f"OCR 找到输入提示 '{text[:20]}'，点击 ({click_x},{click_y})")
+                        self.device.click(click_x, click_y)
+                        time.sleep(1)
+                        # 输入答案
+                        self.device.send_keys(answers[0])
+                        logger.info(f"已填写: {answers[0]}")
+                        # 多空处理
+                        for i, ans in enumerate(answers[1:], 1):
+                            self.device.press("tab")
+                            time.sleep(0.5)
+                            self.device.send_keys(ans)
+                            logger.info(f"已填写第{i+1}空: {ans}")
+                        return True
+
+            # 策略2：找空白区域（题目下方的空白行可能是输入框）
+            # 找所有文本节点的最下方位置，然后在下方找空白区域
+            max_y = 0
+            for node in raw_nodes:
+                bounds = node.get("bounds")
+                if bounds and bounds[1] > max_y:
+                    max_y = bounds[1]
+
+            # 在题目文本下方尝试找输入框
+            # 填空题的输入框通常在题目下方 50-200px 处
+            if max_y > 0:
+                for offset in [80, 120, 160, 200]:
+                    click_y = max_y + offset
+                    if click_y < sh * 0.85:
+                        click_x = int(sw * 0.5)
+                        logger.info(f"尝试点击题目下方区域 ({click_x},{click_y})")
+                        self.device.click(click_x, click_y)
+                        time.sleep(1)
+                        # 检查是否唤起了输入法
+                        if self.device(resourceId="com.android.inputmethod/.InputMethodService"):
+                            self.device.send_keys(answers[0])
+                            return True
+                        # 直接尝试输入
+                        try:
+                            self.device.send_keys(answers[0])
+                            logger.info(f"已填写: {answers[0]}")
+                            return True
+                        except Exception:
+                            continue
+
+            # 策略3：屏幕中间区域逐个尝试
+            for y_ratio in [0.5, 0.55, 0.6, 0.65, 0.7]:
+                click_x = int(sw * 0.5)
+                click_y = int(sh * y_ratio)
+                logger.info(f"尝试点击屏幕中间 ({click_x},{click_y})")
+                self.device.click(click_x, click_y)
+                time.sleep(0.8)
+                try:
+                    self.device.send_keys(answers[0])
+                    logger.info(f"已填写: {answers[0]}")
+                    return True
+                except Exception:
+                    continue
+
             return False
         return await asyncio.to_thread(_fill)
 
@@ -1831,7 +1991,8 @@ class WeChatMiniProgramAutomator:
 
             if result.success and result.answer_letters:
                 if question.question_type == "fill":
-                    await self.fill_answer(question, result.answer_letters[0])
+                    # 填空题：传入所有答案（answer_letters 是答案文本列表）
+                    await self.fill_answer(question, result.answer_letters)
                 else:
                     await self.select_answer(question, result.answer_letters)
                 if result.reasoning:

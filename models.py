@@ -45,9 +45,32 @@ def build_prompt(question: Question) -> str:
     """构建发送给 AI 的提示词，要求严格的输出格式"""
     type_name = TYPE_NAMES.get(question.question_type, "选择题")
     lines = []
-    lines.append(f"这是一道{type_name}，请选出正确答案。")
+
+    if question.question_type == "fill":
+        lines.append("这是一道填空题，请填写题目的空白处。")
+    else:
+        lines.append(f"这是一道{type_name}，请选出正确答案。")
     lines.append("")
-    lines.append(f"题目：{question.text}")
+
+    # 填空题：标注空的位置
+    if question.question_type == "fill":
+        # 将题目中的空（____、（）等）统一标注为【空1】【空2】
+        display_text = question.text
+        blank_count = 0
+        # 替换各种空白表示
+        display_text = re.sub(r"_{2,}", lambda m: f"【空{blank_count := blank_count + 1}】", display_text)
+        if blank_count == 0:
+            display_text = re.sub(r"（\s*）", lambda m: f"【空{blank_count := blank_count + 1}】", display_text)
+        if blank_count == 0:
+            display_text = re.sub(r"\(\s*\)", lambda m: f"【空{blank_count := blank_count + 1}】", display_text)
+        lines.append(f"题目：{display_text}")
+        if blank_count > 1:
+            lines.append(f"共有 {blank_count} 个空需要填写。")
+        elif blank_count == 0:
+            lines.append("题目中有需要填写的空白处。")
+    else:
+        lines.append(f"题目：{question.text}")
+
     lines.append("")
 
     if question.options:
@@ -57,7 +80,7 @@ def build_prompt(question: Question) -> str:
 
     # 严格格式要求
     lines.append("要求：")
-    lines.append("1. 仔细阅读题目和所有选项后再作答")
+    lines.append("1. 仔细阅读题目后再作答")
     if question.question_type == "multiple":
         lines.append("2. 这是多选题，可能有一个或多个正确答案")
         lines.append("3. 请只输出答案字母，不要输出其他内容")
@@ -67,13 +90,18 @@ def build_prompt(question: Question) -> str:
         lines.append("3. 请只输出答案，不要输出其他内容")
         lines.append('输出格式：【答案】正确 或 【答案】错误')
     elif question.question_type == "fill":
-        lines.append("2. 请填写题目的空白处")
-        lines.append("3. 请只输出答案，不要输出其他内容")
-        lines.append("输出格式：【答案】填空内容")
+        if blank_count > 1:
+            lines.append("2. 请按顺序填写每个空的内容")
+            lines.append("3. 多个空的答案用 | 分隔")
+            lines.append('输出格式：【答案】答案1|答案2|答案3')
+        else:
+            lines.append("2. 请填写题目的空白处")
+            lines.append("3. 请只输出答案内容，不要输出其他内容")
+            lines.append('输出格式：【答案】填空内容')
     else:
         lines.append("2. 这是单选题，只有一个正确答案")
         lines.append("3. 请只输出答案字母，不要输出其他内容")
-        lines.append("输出格式：【答案】A")
+        lines.append('输出格式：【答案】A')
     lines.append("")
     lines.append("注意：必须严格按照上述格式输出，第一行必须是【答案】开头。")
 
@@ -106,7 +134,17 @@ def parse_response(response: str, question: Question) -> Tuple[List[str], str]:
             else:
                 answer_letters = [answer_str]
         elif question.question_type == "fill":
-            answer_letters = [answer_str]
+            # 填空题：支持多个答案（用 | 分隔）
+            # 清理答案文本：去掉多余前缀如"空1："等
+            answer_str_clean = re.sub(r"空\d+\s*[：:]\s*", "", answer_str)
+            answer_str_clean = re.sub(r"【空\d+】\s*", "", answer_str_clean)
+            # 按 | 分隔多个答案
+            parts = re.split(r"[|｜]", answer_str_clean)
+            parts = [p.strip() for p in parts if p.strip()]
+            if parts:
+                answer_letters = parts
+            else:
+                answer_letters = [answer_str.strip()]
         else:
             # 选择题：提取连续的大写字母
             letter_matches = re.findall(r"[A-Z]", answer_str.upper())
@@ -171,8 +209,8 @@ def parse_response(response: str, question: Question) -> Tuple[List[str], str]:
                 logger.debug(f"回退匹配到独立字母: {m.group(1)}")
                 break
 
-    # 验证答案是否在有效选项范围内
-    if question.options and answer_letters:
+    # 验证答案是否在有效选项范围内（仅选择题需要验证）
+    if question.options and answer_letters and question.question_type not in ("fill", "judge"):
         valid_letters = {opt[0] for opt in question.options}
         answer_letters = [l for l in answer_letters if l in valid_letters]
 
