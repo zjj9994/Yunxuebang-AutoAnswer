@@ -472,157 +472,149 @@ class DeepSeekWebClient:
 
     async def _extract_latest_response(self) -> str:
         """提取最新的 AI 回复文本"""
-        # 策略1：JavaScript 智能提取，严格过滤 UI 文本和用户消息
+        # 策略1：直接获取页面所有文本，找包含【答案】的部分
         try:
-            js_code = """
-            () => {
-                // UI 黑名单关键词
-                const uiBlacklist = [
-                    '内容由 AI 生成', '请仔细甄别', '深度思考', '智能搜索',
-                    '联网搜索', '重新生成', '复制', '点赞', '踩',
-                    '发送消息', '新建对话', 'DeepThink', 'Web Search',
-                    '快速模式', '上传文件',
-                    '单选题', '多选题', '判断题', '填空题',
-                    '这是一道', '请选出正确答案', '请只输出答案',
-                    '输出格式', '注意：必须严格按照',
-                ];
+            page_text = await self.page.evaluate("""
+                () => {
+                    // 获取页面上所有可见文本节点
+                    const walker = document.createTreeWalker(
+                        document.body,
+                        NodeFilter.SHOW_TEXT,
+                        {
+                            acceptNode: function(node) {
+                                const parent = node.parentElement;
+                                if (!parent) return NodeFilter.FILTER_REJECT;
+                                // 排除 script/style
+                                const tag = parent.tagName.toLowerCase();
+                                if (tag === 'script' || tag === 'style' || tag === 'noscript') {
+                                    return NodeFilter.FILTER_REJECT;
+                                }
+                                // 排除不可见元素
+                                const style = window.getComputedStyle(parent);
+                                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                                    return NodeFilter.FILTER_REJECT;
+                                }
+                                const text = node.textContent.trim();
+                                if (text.length === 0) return NodeFilter.FILTER_REJECT;
+                                return NodeFilter.FILTER_ACCEPT;
+                            }
+                        }
+                    );
 
-                function isUiText(text) {
-                    if (text.includes('【答案】') || text.includes('【解析】')) return false;
-                    if (text.length < 5) return true;
-                    for (const kw of uiBlacklist) {
-                        if (text.includes(kw)) return true;
+                    const texts = [];
+                    let node;
+                    while (node = walker.nextNode()) {
+                        texts.push(node.textContent.trim());
                     }
-                    // 去掉所有 UI 关键词后剩余太短
-                    let nonUi = text;
-                    for (const kw of uiBlacklist) {
-                        nonUi = nonUi.split(kw).join('');
-                    }
-                    nonUi = nonUi.trim();
-                    if (nonUi.length < 20 && text.length < 200) return true;
-                    // 重复文本检测
-                    if (text.length < 100) {
-                        const half = Math.floor(text.length / 2);
-                        if (half > 5 && text.substring(0, half) === text.substring(half, half * 2)) return true;
-                    }
-                    return false;
+                    return texts.join('\\n');
                 }
+            """)
 
-                function isUserMessage(text) {
-                    // 用户消息包含提示词特征
-                    if (text.includes('这是一道') && text.includes('题目：')) return true;
-                    if (text.includes('请只输出答案') || text.includes('输出格式')) return true;
-                    if (text.includes('请选出正确答案')) return true;
-                    // 填空题提示词
-                    if (text.includes('请填写题目') && text.includes('空白处')) return true;
-                    return false;
-                }
+            if page_text:
+                # 找包含【答案】的行
+                if "【答案】" in page_text:
+                    # 找到【答案】所在位置，提取前后文本
+                    idx = page_text.index("【答案】")
+                    # 向前找到回复开始（找最近的换行或开头）
+                    # AI 回复通常以【答案】开头或在一段文本后
+                    start = max(0, idx - 500)
+                    # 向后找到回复结束
+                    end = min(len(page_text), idx + 500)
+                    # 尝试找到【解析】标记
+                    reasoning_idx = page_text.find("【解析】", idx)
+                    if reasoning_idx >= 0:
+                        end = min(len(page_text), reasoning_idx + 500)
 
-                // 查找所有可能包含 AI 回复的元素
-                // 优先级：markdown 渲染区 > 消息内容区 > 一般 div
-                const selectors = [
-                    '[class*="markdown"]',
-                    '[class*="message"] [class*="content"]',
-                    '[class*="response"]',
-                    '[class*="answer"]',
-                    '[class*="prose"]',
-                    '[class*="bot"]',
-                    'div[class*="content"]',
-                ];
-
-                const candidates = [];
-                for (const selector of selectors) {
-                    const elements = document.querySelectorAll(selector);
-                    for (const el of elements) {
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width < 100 || rect.height < 10) continue;
-
-                        // 只取叶子级别的文本（避免父容器包含用户消息）
-                        const fullText = (el.textContent || '').trim();
-                        if (fullText.length < 5) continue;
-
-                        // 排除用户消息
-                        if (isUserMessage(fullText)) continue;
-                        // 排除 UI 文本
-                        if (isUiText(fullText)) continue;
-                        // 排除侧边栏
-                        if (rect.width < 300) continue;
-                        // 排除输入框区域
-                        if (rect.bottom > window.innerHeight * 0.9) continue;
-
-                        candidates.push({
-                            text: fullText,
-                            top: rect.top,
-                            bottom: rect.bottom,
-                            height: rect.height,
-                            width: rect.width,
-                            area: rect.width * rect.height,
-                        });
-                    }
-                }
-
-                if (candidates.length === 0) return '';
-
-                // 按面积排序，大的优先（AI 回复通常面积最大）
-                candidates.sort((a, b) => b.area - a.area);
-
-                // 优先找包含【答案】的
-                for (const c of candidates) {
-                    if (c.text.includes('【答案】')) {
-                        return c.text;
-                    }
-                }
-
-                // 取面积最大的有效文本
-                // 但要排除太大的容器（可能包含多个消息）
-                const filtered = candidates.filter(c => c.height < 2000);
-                if (filtered.length > 0) {
-                    // 在合理大小的容器中，取最靠下的（最新回复）
-                    filtered.sort((a, b) => b.top - a.top);
-                    return filtered[0].text;
-                }
-
-                return candidates[0].text;
-            }
-            """
-            result = await self.page.evaluate(js_code)
-            if result and len(result) > 5:
-                result = result.strip()
-                # 二次验证
-                if not self._is_ui_text(result):
-                    logger.debug(f"JS 提取回复成功（{len(result)} 字）: {result[:80]}")
+                    result = page_text[start:end].strip()
+                    logger.debug(f"策略1提取到回复（{len(result)}字）: {result[:80]}")
                     return result
                 else:
-                    logger.debug(f"提取到 UI 文本，跳过: {result[:80]}")
-            elif result:
-                logger.debug(f"提取回复太短: '{result}'")
-        except Exception as e:
-            logger.debug(f"JavaScript 提取回复失败: {e}")
+                    # 没有【答案】，找最长的非 UI 文本块
+                    lines = page_text.split("\n")
+                    best_text = ""
+                    current_block = []
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            if current_block:
+                                block_text = "\n".join(current_block)
+                                if not self._is_ui_text(block_text) and len(block_text) > len(best_text):
+                                    best_text = block_text
+                                current_block = []
+                            continue
+                        # 跳过用户消息行
+                        if "这是一道" in line and "题目：" in line:
+                            current_block = []
+                            continue
+                        if "请只输出答案" in line or "输出格式" in line:
+                            current_block = []
+                            continue
+                        current_block.append(line)
+                    # 最后一块
+                    if current_block:
+                        block_text = "\n".join(current_block)
+                        if not self._is_ui_text(block_text) and len(block_text) > len(best_text):
+                            best_text = block_text
 
-        # 策略2：通过 CSS 选择器查找
+                    if best_text:
+                        logger.debug(f"策略1b提取到回复（{len(best_text)}字）: {best_text[:80]}")
+                        return best_text
+
+        except Exception as e:
+            logger.debug(f"策略1提取失败: {e}")
+
+        # 策略2：通过 CSS 选择器查找（更宽松）
         response_selectors = [
-            "[class*='markdown']:last-of-type",
-            "[class*='message']:last-child [class*='content']",
-            "[class*='answer']:last-child",
-            "[class*='response']:last-child",
-            "[class*='prose']:last-of-type",
-            "[class*='bot']:last-child",
-            "div[class*='content']:last-of-type",
+            "[class*='markdown']",
+            "[class*='message'] [class*='content']",
+            "[class*='response']",
+            "[class*='answer']",
+            "[class*='prose']",
+            "[class*='bot']",
+            "div[class*='content']",
         ]
         for selector in response_selectors:
             try:
                 elements = self.page.locator(selector)
                 count = await elements.count()
                 if count > 0:
-                    text = await elements.nth(count - 1).inner_text()
-                    text = text.strip()
-                    if text and len(text) > 10:
-                        if not self._is_ui_text(text):
-                            if not ("这是一道" in text and "题目：" in text):
-                                logger.debug(f"CSS 选择器 '{selector}' 提取成功: {text[:80]}")
-                                return text
+                    # 从最后一个往前找
+                    for i in range(count - 1, -1, -1):
+                        text = await elements.nth(i).inner_text()
+                        text = text.strip()
+                        if not text or len(text) < 5:
+                            continue
+                        if "这是一道" in text and "题目：" in text:
+                            continue
+                        if self._is_ui_text(text):
+                            continue
+                        logger.debug(f"CSS '{selector}' [{i}] 提取成功: {text[:80]}")
+                        return text
             except Exception:
                 continue
+
+        # 策略3：获取页面 body 的 innerText，找最后的非空内容
+        try:
+            body_text = await self.page.evaluate("() => document.body.innerText")
+            if body_text:
+                # 找【答案】
+                if "【答案】" in body_text:
+                    idx = body_text.rindex("【答案】")
+                    start = max(0, idx - 300)
+                    end = min(len(body_text), idx + 300)
+                    result = body_text[start:end].strip()
+                    logger.debug(f"策略3提取到回复: {result[:80]}")
+                    return result
+                # 找最后一段有意义的文本
+                lines = body_text.strip().split("\n")
+                meaningful = [l.strip() for l in lines if l.strip() and not self._is_ui_text(l.strip())]
+                if meaningful:
+                    result = meaningful[-1]
+                    if len(result) > 5:
+                        logger.debug(f"策略3b提取到回复: {result[:80]}")
+                        return result
+        except Exception as e:
+            logger.debug(f"策略3提取失败: {e}")
 
         return ""
 

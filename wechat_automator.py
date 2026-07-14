@@ -894,37 +894,59 @@ class WeChatMiniProgramAutomator:
             question_candidates.append((text, node))
 
         # === 关键步骤：将单独的字母节点和同 y 坐标的文字节点配对 ===
-        # OCR 常把 "A" 和 "正确" 分成两个节点，需要合并
+        # OCR 常把 "A" 和 "9:1" 分成两个节点，需要合并
         if option_candidates:
+            # 收集所有未配对的节点（不是选项字母也不是题目文本的短文本）
+            # 这些可能是选项内容（如 "9:1", "3:1" 等）
+            orphan_nodes = []
+            for node in sorted_nodes:
+                text = node["display"].strip()
+                if not text or len(text) < 1:
+                    continue
+                # 跳过已经是选项字母的
+                if text in VALID_SINGLE_CHARS:
+                    continue
+                # 跳过已经是选项的
+                if any(text == oc[1] for oc in option_candidates if oc[1]):
+                    continue
+                # 跳过题型标签和页码
+                if _is_question_type_label(text) or _is_page_indicator(text):
+                    continue
+                # 跳过太长的（题目文本）
+                if len(text) > 100:
+                    continue
+                # 跳过导航栏和按钮
+                if _is_nav_bar_text(text) or _is_button_text(text):
+                    continue
+                # 这个节点可能是选项内容
+                orphan_nodes.append((text, node))
+
             # 找出内容为空的字母节点
             empty_letters = [oc for oc in option_candidates if not oc[1]]
-            filled_letters = [oc for oc in option_candidates if oc[1]]
 
             for empty_oc in empty_letters:
                 letter = empty_oc[0]
                 letter_y = empty_oc[2].get("bounds", (0, 9999))[1]
                 letter_x = empty_oc[2].get("bounds", (0, 0))[0]
 
-                # 先在 judge_option_nodes 中找同 y 坐标的
                 matched = False
+
+                # 先在 judge_option_nodes 中找同 y 坐标的
                 for jo in judge_option_nodes:
                     jo_y = jo[2].get("bounds", (0, 9999))[1]
-                    # y 坐标差距小于 60px 认为是同一行
                     if abs(jo_y - letter_y) < 60:
-                        # 配对成功
                         empty_oc_list = list(empty_oc)
                         empty_oc_list[1] = jo[1]
                         option_candidates[option_candidates.index(empty_oc)] = tuple(empty_oc_list)
                         matched = True
-                        # 从 judge_option_nodes 中移除已配对的
                         judge_option_nodes.remove(jo)
                         break
 
-                # 如果没在 judge_option_nodes 中找到，在 question_candidates 中找
+                # 在 orphan_nodes 中找同 y 坐标的选项内容
                 if not matched:
                     best_match = None
                     best_dist = 9999
-                    for text, node in question_candidates:
+                    for text, node in orphan_nodes:
                         ny = node.get("bounds", (0, 9999))[1]
                         nx = node.get("bounds", (0, 0))[0]
                         # 同一行（y 差距小于 60px）且在字母右侧
@@ -938,7 +960,26 @@ class WeChatMiniProgramAutomator:
                         empty_oc_list = list(empty_oc)
                         empty_oc_list[1] = best_match[0]
                         option_candidates[option_candidates.index(empty_oc)] = tuple(empty_oc_list)
-                        # 从 question_candidates 中移除已配对的
+                        orphan_nodes.remove(best_match)
+                        matched = True
+
+                # 如果还没配对，在 question_candidates 中找
+                if not matched:
+                    best_match = None
+                    best_dist = 9999
+                    for text, node in question_candidates:
+                        ny = node.get("bounds", (0, 9999))[1]
+                        nx = node.get("bounds", (0, 0))[0]
+                        if abs(ny - letter_y) < 60 and nx > letter_x:
+                            dist = abs(ny - letter_y) + abs(nx - letter_x) * 0.1
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_match = (text, node)
+
+                    if best_match:
+                        empty_oc_list = list(empty_oc)
+                        empty_oc_list[1] = best_match[0]
+                        option_candidates[option_candidates.index(empty_oc)] = tuple(empty_oc_list)
                         question_candidates.remove(best_match)
 
         # 合并判断题选项（未被字母配对的剩余选项）
