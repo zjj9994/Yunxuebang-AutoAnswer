@@ -525,7 +525,11 @@ class WeChatMiniProgramAutomator:
             return []
 
         full_text = "\n".join([n["display"] for n in nodes])
-        logger.debug(f"[{source}] 过滤后屏幕文本:\n{full_text[:500]}")
+        logger.info(f"[{source}] 过滤后屏幕文本（{len(nodes)} 个节点）:")
+        for n in nodes:
+            bounds_str = n.get("bounds_str", "")
+            logger.info(f"  '{n['display'][:80]}' bounds={bounds_str}")
+        logger.debug(f"[{source}] 合并文本:\n{full_text[:500]}")
 
         # 从节点中解析题目
         question = self._parse_single_question(nodes)
@@ -593,17 +597,37 @@ class WeChatMiniProgramAutomator:
     # ===================== 题目解析 =====================
 
     def _parse_single_question(self, nodes: list) -> Optional[Question]:
-        """从过滤后的节点中解析单道题目"""
+        """从过滤后的节点中解析单道题目（支持 OCR 分块合并）"""
+        if not nodes:
+            return None
+
+        # 按 y 坐标排序（从上到下）
+        sorted_nodes = sorted(nodes, key=lambda n: (
+            n.get("bounds", (0, 9999))[1] if n.get("bounds") else 9999,
+            n.get("bounds", (0, 0))[0] if n.get("bounds") else 0,
+        ))
+
+        # 第一步：尝试从合并文本中提取（处理 OCR 分块问题）
+        full_text = "\n".join([n["display"] for n in sorted_nodes])
+        question_from_text = self._parse_question_from_text(full_text)
+        if question_from_text and question_from_text.text and len(question_from_text.text) > 3:
+            # 补充坐标信息
+            if not question_from_text.options:
+                # 没有选项，但也返回题目
+                pass
+            return question_from_text
+
+        # 第二步：按节点位置分析
         question_candidates = []
         option_candidates = []
 
-        for node in nodes:
+        for node in sorted_nodes:
             text = node["display"].strip()
             if not text:
                 continue
 
-            # 检查是否是选项（A. xxx / A、xxx / A) xxx）
-            opt_match = re.match(r"^([A-D])\s*[.、）)\]]\s*(.+)", text)
+            # 检查是否是选项（A. xxx / A、xxx / A) xxx / A.xxx）
+            opt_match = re.match(r"^([A-D])\s*[.、）)\].]\s*(.+)", text)
             if opt_match:
                 option_candidates.append((opt_match.group(1), opt_match.group(2).strip(), node))
                 continue
@@ -611,6 +635,12 @@ class WeChatMiniProgramAutomator:
             # 检查是否是选项（只有字母 A/B/C/D）
             if re.match(r"^([A-D])$", text) and len(text) == 1:
                 option_candidates.append((text, "", node))
+                continue
+
+            # 检查是否是选项（A 开头后跟文字，如 "A正确" "B错误"）
+            opt_match2 = re.match(r"^([A-D])(.{2,})", text)
+            if opt_match2 and len(text) <= 20:
+                option_candidates.append((opt_match2.group(1), opt_match2.group(2).strip(), node))
                 continue
 
             # 排除太短的
@@ -631,28 +661,76 @@ class WeChatMiniProgramAutomator:
             unique_opts.sort(key=lambda x: x[0])
             options = [(oc[0], oc[1]) for oc in unique_opts]
 
-            # 找题目：选项上方最长的文本
+            # 找题目：合并选项上方的所有文本（OCR 可能将题目分成多块）
             first_opt_y = unique_opts[0][2]["bounds"][1] if unique_opts[0][2].get("bounds") else 9999
 
-            best_q = ""
+            # 合并选项上方的所有候选文本
+            above_texts = []
             for text, node in question_candidates:
                 ny = node["bounds"][1] if node.get("bounds") else 9999
-                if ny <= first_opt_y and len(text) > len(best_q):
-                    best_q = text
+                if ny <= first_opt_y:
+                    above_texts.append(text)
 
-            if not best_q and question_candidates:
+            if above_texts:
+                best_q = "".join(above_texts)
+            elif question_candidates:
+                # 没有在选项上方的文本，取最长的
                 best_q = max(question_candidates, key=lambda x: len(x[0]))[0]
+            else:
+                best_q = ""
 
             qtype = self._detect_type(best_q, options)
             return Question(index=0, text=best_q, options=options, question_type=qtype)
 
-        # 无选项（判断题/填空题）
+        # 无选项（判断题/填空题）- 合并所有候选文本
         if question_candidates:
-            best = max(question_candidates, key=lambda x: len(x[0]))
-            qtype = self._detect_type(best[0], [])
-            return Question(index=0, text=best[0], options=[], question_type=qtype)
+            # 合并所有文本块作为完整题目
+            merged_text = "".join([t for t, _ in question_candidates])
+            qtype = self._detect_type(merged_text, [])
+            return Question(index=0, text=merged_text, options=[], question_type=qtype)
 
         return None
+
+    def _parse_question_from_text(self, full_text: str) -> Optional[Question]:
+        """从合并的文本中解析题目（处理 OCR 分块合并后的文本）"""
+        if not full_text or len(full_text) < 3:
+            return None
+
+        # 尝试提取选项
+        options = self._extract_options_from_text(full_text)
+
+        # 尝试多种选项格式
+        if not options:
+            # 尝试 A.xxx B.xxx 格式（无分隔符）
+            pattern = r"([A-D])\s*[.、）)\]]?\s*(.{2,}?)(?=\s*[A-D]\s*[.、）)\]]|$)"
+            matches = re.findall(pattern, full_text)
+            if len(matches) >= 2:
+                options = [(m[0], m[1].strip()) for m in matches if m[1].strip()]
+
+        if not options:
+            # 尝试 A正确 B错误 格式
+            pattern = r"([A-D])\s*(正确|错误|对|错|是|否|True|False)"
+            matches = re.findall(pattern, full_text)
+            if len(matches) >= 2:
+                options = [(m[0], m[1].strip()) for m in matches]
+
+        # 移除选项部分，剩余的是题目
+        question_text = full_text
+        for letter, opt in options:
+            # 移除各种格式的选项
+            question_text = re.sub(
+                rf"{letter}\s*[.、）)\]]?\s*{re.escape(opt)}", "", question_text
+            )
+        question_text = question_text.strip()
+
+        # 清理多余换行和空格
+        question_text = re.sub(r"\n{2,}", "\n", question_text).strip()
+
+        if not question_text or len(question_text) < 3:
+            return None
+
+        qtype = self._detect_type(question_text, options)
+        return Question(index=0, text=question_text, options=options, question_type=qtype)
 
     def _parse_multiple_from_text(self, full_text: str) -> List[Question]:
         """按题号分割多题"""

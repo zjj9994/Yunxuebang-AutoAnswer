@@ -314,10 +314,12 @@ class DeepSeekWebClient:
         last_text = ""
         stable_count = 0
         required_stable = 3  # 连续3次内容不变视为完成
+        poll_count = 0
 
         while time.time() - start_time < timeout:
             is_generating = await self._is_still_generating()
             current_text = await self._extract_latest_response()
+            poll_count += 1
 
             if current_text and current_text == last_text:
                 stable_count += 1
@@ -325,10 +327,15 @@ class DeepSeekWebClient:
                 stable_count = 0
                 last_text = current_text
 
+            # 每3次轮询记录一次提取到的内容
+            if poll_count % 3 == 0 and current_text:
+                logger.debug(f"轮询中 ({poll_count}次), 当前文本: {current_text[:80]}...")
+
             # 内容稳定且不再生成
             if stable_count >= required_stable and not is_generating and current_text:
                 elapsed = time.time() - start_time
                 logger.info(f"DeepSeek 回复完成（耗时 {elapsed:.1f}s）")
+                logger.debug(f"最终回复内容（前200字）:\n{current_text[:200]}")
                 return current_text
 
             await self.page.wait_for_timeout(int(poll_interval * 1000))
@@ -396,118 +403,164 @@ class DeepSeekWebClient:
         "重新生成", "复制", "点赞", "踩", "分享",
         "发送消息", "Send a message",
         "新建对话", "New chat",
+        "快速模式", "联网搜索", "上传文件",
+        "单选题", "多选题", "判断题", "填空题",
+        "这是一道", "请选出正确答案", "请只输出答案",
+        "输出格式", "注意：必须严格按照",
     ]
 
     def _is_ui_text(self, text: str) -> bool:
         """判断文本是否是 DeepSeek 页面的 UI 文本而非 AI 回复"""
+        # 包含【答案】的一定是有效回复
+        if "【答案】" in text:
+            return False
         # 太短的不可能是有效回复
         if len(text) < 10:
             return True
         # 检查黑名单
         for pattern in self.UI_BLACKLIST_PATTERNS:
             if pattern in text:
-                # 但如果文本中同时包含【答案】，可能是有效回复（AI 引用了这些词）
-                if "【答案】" not in text:
-                    return True
-        # 纯 UI 按钮文字组合（如 "深度思考智能搜索内容由 AI 生成，请仔细甄别"）
+                return True
+        # 纯 UI 按钮文字组合
         ui_only = True
         for pattern in self.UI_BLACKLIST_PATTERNS:
             text_without = text.replace(pattern, "").strip()
             if len(text_without) > 20:
                 ui_only = False
                 break
-        if ui_only and len(text) < 100:
+        if ui_only and len(text) < 200:
             return True
+        # 重复文本（如 "真空干燥单选题快速模式真空干燥单选题快速模式"）
+        if len(text) < 100:
+            half = len(text) // 2
+            if half > 5 and text[:half] == text[half:half*2]:
+                return True
         return False
 
     async def _extract_latest_response(self) -> str:
         """提取最新的 AI 回复文本"""
-        # 策略1：JavaScript 智能提取，严格过滤 UI 文本
+        # 策略1：JavaScript 智能提取，严格过滤 UI 文本和用户消息
         try:
             js_code = """
             () => {
-                const allElements = document.querySelectorAll(
-                    'div, section, article, p, pre, code'
-                );
-
-                const candidates = [];
-                for (const el of allElements) {
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width < 50 || rect.height < 10) continue;
-
-                    const fullText = (el.textContent || '').trim();
-                    if (fullText.length < 10) continue;
-
-                    candidates.push({
-                        text: fullText,
-                        top: rect.top,
-                        bottom: rect.bottom,
-                        height: rect.height,
-                        width: rect.width,
-                        className: el.className || '',
-                        childCount: el.children.length,
-                    });
-                }
-
-                if (candidates.length === 0) return '';
-
                 // UI 黑名单关键词
                 const uiBlacklist = [
                     '内容由 AI 生成', '请仔细甄别', '深度思考', '智能搜索',
                     '联网搜索', '重新生成', '复制', '点赞', '踩',
                     '发送消息', '新建对话', 'DeepThink', 'Web Search',
+                    '快速模式', '上传文件',
+                    '单选题', '多选题', '判断题', '填空题',
+                    '这是一道', '请选出正确答案', '请只输出答案',
+                    '输出格式', '注意：必须严格按照',
                 ];
 
                 function isUiText(text) {
-                    if (text.length < 10) return true;
-                    // 如果包含【答案】，认为是有效回复
                     if (text.includes('【答案】') || text.includes('【解析】')) return false;
-                    // 检查是否全是 UI 文本
-                    let nonUiText = text;
+                    if (text.length < 10) return true;
                     for (const kw of uiBlacklist) {
-                        nonUiText = nonUiText.split(kw).join('');
+                        if (text.includes(kw)) return true;
                     }
-                    nonUiText = nonUiText.trim();
-                    // 去掉所有 UI 关键词后，如果剩余文本很短，说明是 UI 文本
-                    if (nonUiText.length < 20 && text.length < 100) return true;
+                    // 去掉所有 UI 关键词后剩余太短
+                    let nonUi = text;
+                    for (const kw of uiBlacklist) {
+                        nonUi = nonUi.split(kw).join('');
+                    }
+                    nonUi = nonUi.trim();
+                    if (nonUi.length < 20 && text.length < 200) return true;
+                    // 重复文本检测
+                    if (text.length < 100) {
+                        const half = Math.floor(text.length / 2);
+                        if (half > 5 && text.substring(0, half) === text.substring(half, half * 2)) return true;
+                    }
                     return false;
                 }
 
-                // 过滤掉用户消息和 UI 文本
-                const filtered = candidates.filter(c => {
-                    // 排除用户消息（提示词）
-                    if (c.text.includes('这是一道') && c.text.includes('输出格式')) return false;
-                    if (c.text.includes('请只输出答案')) return false;
-                    // 排除 UI 文本
-                    if (isUiText(c.text)) return false;
-                    // 排除侧边栏
-                    if (c.width < 200) return false;
-                    return true;
-                });
+                function isUserMessage(text) {
+                    // 用户消息包含提示词特征
+                    if (text.includes('这是一道') && text.includes('题目：')) return true;
+                    if (text.includes('请只输出答案') || text.includes('输出格式')) return true;
+                    if (text.includes('请选出正确答案')) return true;
+                    return false;
+                }
 
-                if (filtered.length === 0) return '';
+                // 查找所有可能包含 AI 回复的元素
+                // 优先级：markdown 渲染区 > 消息内容区 > 一般 div
+                const selectors = [
+                    '[class*="markdown"]',
+                    '[class*="message"] [class*="content"]',
+                    '[class*="response"]',
+                    '[class*="answer"]',
+                    '[class*="prose"]',
+                    '[class*="bot"]',
+                    'div[class*="content"]',
+                ];
 
-                // 按位置排序，取最后一个（最新的回复）
-                filtered.sort((a, b) => a.top - b.top);
+                const candidates = [];
+                for (const selector of selectors) {
+                    const elements = document.querySelectorAll(selector);
+                    for (const el of elements) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 100 || rect.height < 10) continue;
 
-                // 优先找包含【答案】的
-                for (let i = filtered.length - 1; i >= 0; i--) {
-                    if (filtered[i].text.includes('【答案】')) {
-                        return filtered[i].text;
+                        // 只取叶子级别的文本（避免父容器包含用户消息）
+                        const fullText = (el.textContent || '').trim();
+                        if (fullText.length < 5) continue;
+
+                        // 排除用户消息
+                        if (isUserMessage(fullText)) continue;
+                        // 排除 UI 文本
+                        if (isUiText(fullText)) continue;
+                        // 排除侧边栏
+                        if (rect.width < 300) continue;
+                        // 排除输入框区域
+                        if (rect.bottom > window.innerHeight * 0.9) continue;
+
+                        candidates.push({
+                            text: fullText,
+                            top: rect.top,
+                            bottom: rect.bottom,
+                            height: rect.height,
+                            width: rect.width,
+                            area: rect.width * rect.height,
+                        });
                     }
                 }
 
-                // 回退：取最后一个有效文本
-                return filtered[filtered.length - 1].text;
+                if (candidates.length === 0) return '';
+
+                // 按面积排序，大的优先（AI 回复通常面积最大）
+                candidates.sort((a, b) => b.area - a.area);
+
+                // 优先找包含【答案】的
+                for (const c of candidates) {
+                    if (c.text.includes('【答案】')) {
+                        return c.text;
+                    }
+                }
+
+                // 取面积最大的有效文本
+                // 但要排除太大的容器（可能包含多个消息）
+                const filtered = candidates.filter(c => c.height < 2000);
+                if (filtered.length > 0) {
+                    // 在合理大小的容器中，取最靠下的（最新回复）
+                    filtered.sort((a, b) => b.top - a.top);
+                    return filtered[0].text;
+                }
+
+                return candidates[0].text;
             }
             """
             result = await self.page.evaluate(js_code)
-            if result and len(result) > 10:
-                # 二次验证：确保不是 UI 文本
+            if result and len(result) > 5:
+                result = result.strip()
+                # 二次验证
                 if not self._is_ui_text(result):
-                    return result.strip()
+                    logger.debug(f"JS 提取回复成功（{len(result)} 字）: {result[:80]}")
+                    return result
                 else:
                     logger.debug(f"提取到 UI 文本，跳过: {result[:80]}")
+            elif result:
+                logger.debug(f"提取回复太短: '{result}'")
         except Exception as e:
             logger.debug(f"JavaScript 提取回复失败: {e}")
 
@@ -530,7 +583,8 @@ class DeepSeekWebClient:
                     text = text.strip()
                     if text and len(text) > 10:
                         if not self._is_ui_text(text):
-                            if "这是一道" not in text and "输出格式" not in text:
+                            if not ("这是一道" in text and "题目：" in text):
+                                logger.debug(f"CSS 选择器 '{selector}' 提取成功: {text[:80]}")
                                 return text
             except Exception:
                 continue
