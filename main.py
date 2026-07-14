@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+云学帮自动刷题脚本 - 主程序
+通过 DeepSeek 网页版自动回答云学帮平台上的题目，无需 API Key
+
+支持两种模式：
+  1. web     - Playwright 浏览器自动化（DeepSeek + 云学帮 同一浏览器双标签页）
+  2. android - 手机操作云学帮 APP + 电脑浏览器操作 DeepSeek
+
+用法:
+  python main.py                     # 默认 Web 模式
+  python main.py --mode android      # Android 模式
+  python main.py --thinking          # 开启 DeepSeek 深度思考
+  python main.py --inspect           # 页面检查模式（调试用）
+  python main.py --auto-submit       # 自动提交（不等待确认）
+"""
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config import AppConfig, load_config_from_env
+from models import AnswerResult
+
+
+def setup_logging(config: AppConfig):
+    """配置日志"""
+    level = logging.DEBUG if config.debug else logging.INFO
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    datefmt = "%H:%M:%S"
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(level)
+    console.setFormatter(logging.Formatter(fmt, datefmt))
+
+    file_handler = logging.FileHandler(config.log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(fmt, datefmt))
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.handlers.clear()
+    root_logger.addHandler(console)
+    root_logger.addHandler(file_handler)
+
+
+def print_banner():
+    """打印启动横幅"""
+    banner = """
++----------------------------------------------------------+
+|          云学帮自动刷题脚本 (DeepSeek 网页版驱动)          |
+|                                                          |
+|  AI 引擎: DeepSeek 网页版 (chat.deepseek.com)             |
+|  平台: 云学帮                                             |
+|  引擎: Playwright (Web) / uiautomator2 (Android)         |
+|  特点: 无需 API Key，直接使用网页版对话                    |
++----------------------------------------------------------+
+"""
+    print(banner)
+
+
+def print_results_summary(results: list, stats_file: str):
+    """打印答题结果摘要并保存统计"""
+    total = len(results)
+    success = sum(1 for r in results if r.success)
+    failed = total - success
+
+    print(f"\n{'='*60}")
+    print(f"答题完成！共 {total} 题，成功 {success} 题，失败 {failed} 题")
+    print(f"{'='*60}\n")
+
+    for r in results:
+        status = "OK" if r.success else "FAIL"
+        letters = "".join(r.answer_letters) if r.answer_letters else "N/A"
+        print(f"  [{status}] 第{r.question.index + 1}题: {letters} | {r.question.text[:40]}...")
+
+    stats = {
+        "timestamp": datetime.now().isoformat(),
+        "total": total,
+        "success": success,
+        "failed": failed,
+        "details": [
+            {
+                "index": r.question.index,
+                "type": r.question.question_type,
+                "question": r.question.text[:200],
+                "answer": "".join(r.answer_letters),
+                "reasoning": r.reasoning[:200],
+                "success": r.success,
+                "error": r.error,
+            }
+            for r in results
+        ],
+    }
+    try:
+        with open(stats_file, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+        print(f"\n统计已保存到: {stats_file}")
+    except Exception as e:
+        print(f"保存统计失败: {e}")
+
+
+async def run_web_mode(config: AppConfig, args):
+    """Web 模式：同一浏览器中 DeepSeek + 云学帮 双标签页"""
+    from web_automator import WebAutomator
+
+    automator = WebAutomator(config.web, config.deepseek)
+
+    try:
+        # 1. 启动浏览器
+        await automator.start()
+
+        # 2. 初始化 DeepSeek 标签页
+        await automator.init_deepseek()
+
+        # 3. 用户登录 DeepSeek
+        logger = logging.getLogger(__name__)
+        logger.info("正在打开 DeepSeek 网页...")
+        ds_ready = await automator.ds_client.navigate_and_login()
+        if not ds_ready:
+            logger.error("DeepSeek 未就绪，请检查网络和登录状态")
+            return
+
+        # 4. 导航到云学帮
+        await automator.navigate(config.web.platform_url)
+
+        # 5. 等待用户登录云学帮并进入答题页面
+        await automator.wait_for_user_ready(
+            "请在云学帮标签页登录并进入答题/考试页面"
+        )
+
+        # 检查模式
+        if args.inspect:
+            await automator.inspect_page()
+            await automator.wait_for_user_ready("检查完成")
+            return
+
+        # 6. 执行自动答题
+        results = await automator.run_auto_answer()
+
+        if results:
+            print_results_summary(results, config.stats_file)
+
+    finally:
+        await automator.close()
+
+
+async def run_android_mode(config: AppConfig, args):
+    """Android 模式：手机操作云学帮 + 电脑浏览器操作 DeepSeek"""
+    from android_automator import AndroidAutomator
+
+    automator = AndroidAutomator(config.android, config.deepseek)
+
+    try:
+        # 1. 连接设备 + 初始化 DeepSeek 浏览器
+        await automator.start()
+
+        # 2. 用户登录 DeepSeek
+        logger = logging.getLogger(__name__)
+        logger.info("正在打开 DeepSeek 网页...")
+        await automator.init_deepseek_login()
+
+        # 3. 等待用户在手机上进入答题页面
+        automator.wait_for_user_ready(
+            "请在手机上进入云学帮的答题/考试页面"
+        )
+
+        # 检查模式
+        if args.inspect:
+            await automator.inspect_screen()
+            automator.wait_for_user_ready("检查完成")
+            return
+
+        # 4. 执行自动答题
+        results = await automator.run_auto_answer()
+
+        if results:
+            print_results_summary(results, config.stats_file)
+
+    finally:
+        await automator.close()
+
+
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(
+        description="云学帮自动刷题脚本 - DeepSeek 网页版驱动（无需 API Key）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  %(prog)s                          默认 Web 模式启动
+  %(prog)s --mode android           Android 模式（手机+电脑）
+  %(prog)s --thinking               开启 DeepSeek 深度思考模式
+  %(prog)s --inspect                检查页面/屏幕结构（调试用）
+  %(prog)s --auto-submit            自动提交，不等待确认
+  %(prog)s --url https://xxx.com    指定云学帮平台 URL
+  %(prog)s --delay 3.0              每题延迟 3 秒
+
+环境变量:
+  DEEPSEEK_URL        DeepSeek 网页地址（默认 https://chat.deepseek.com/）
+  DEEPSEEK_THINKING   是否开启深度思考 true/false
+  YUNXUEBANG_URL      云学帮平台 URL
+  AUTO_MODE           运行模式 web/android
+  DEBUG               调试模式 true/false
+""",
+    )
+    parser.add_argument(
+        "--mode", choices=["web", "android"], default="web",
+        help="运行模式: web (浏览器自动化) 或 android (手机+电脑)",
+    )
+    parser.add_argument("--url", help="云学帮平台 URL")
+    parser.add_argument(
+        "--thinking", action="store_true",
+        help="开启 DeepSeek 深度思考模式（更准确但更慢）",
+    )
+    parser.add_argument(
+        "--inspect", action="store_true",
+        help="检查模式：输出页面/屏幕结构，用于调试",
+    )
+    parser.add_argument(
+        "--auto-submit", action="store_true",
+        help="自动提交试卷，不等待用户确认",
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="无头模式（不推荐，DeepSeek 需要手动登录）",
+    )
+    parser.add_argument(
+        "--device", help="Android 设备序列号（通过 adb devices 查看）",
+    )
+    parser.add_argument("--debug", action="store_true", help="开启调试日志")
+    parser.add_argument(
+        "--delay", type=float, default=None,
+        help="每道题之间的延迟秒数（默认 2.0）",
+    )
+    parser.add_argument(
+        "--ds-url", default=None,
+        help="DeepSeek 网页地址（默认 https://chat.deepseek.com/）",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # 加载配置
+    config = load_config_from_env()
+
+    # 应用命令行参数
+    if args.mode:
+        config.mode = args.mode
+    if args.url:
+        config.web.platform_url = args.url
+    if args.thinking:
+        config.deepseek.use_deep_thinking = True
+    if args.auto_submit:
+        config.web.auto_submit = True
+        config.web.confirm_before_submit = False
+        config.android.auto_submit = True
+        config.android.confirm_before_submit = False
+    if args.headless:
+        config.web.headless = True
+        config.deepseek.headless = True
+    if args.device:
+        config.android.device_serial = args.device
+    if args.debug:
+        config.debug = True
+    if args.delay is not None:
+        config.web.question_delay = args.delay
+        config.android.question_delay = args.delay
+        config.deepseek.question_interval = args.delay
+    if args.ds_url:
+        config.deepseek.url = args.ds_url
+
+    # 配置日志
+    setup_logging(config)
+    logger = logging.getLogger(__name__)
+
+    print_banner()
+
+    logger.info(f"运行模式: {config.mode}")
+    logger.info(f"DeepSeek URL: {config.deepseek.url}")
+    logger.info(f"深度思考: {config.deepseek.use_deep_thinking}")
+    logger.info(f"云学帮 URL: {config.web.platform_url}")
+    logger.info(f"自动提交: {config.web.auto_submit if config.mode == 'web' else config.android.auto_submit}")
+
+    # 运行（两种模式都是 async）
+    if config.mode == "web":
+        asyncio.run(run_web_mode(config, args))
+    elif config.mode == "android":
+        asyncio.run(run_android_mode(config, args))
+    else:
+        logger.error(f"未知模式: {config.mode}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+# 云学帮自动刷题脚本 - Python 依赖
+# Python 3.8+ required
+
+# Web 端自动化（Playwright）- 用于操作 DeepSeek 网页版和云学帮 Web 版
+playwright>=1.40.0
+
+# Android 端自动化（uiautomator2）
+# 仅 Android 模式需要安装
+uiautomator2>=3.0.0
+
+# 可选：终端美化输出
+rich>=13.0.0
