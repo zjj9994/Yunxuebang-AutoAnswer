@@ -42,36 +42,40 @@ TYPE_NAMES = {
 
 
 def build_prompt(question: Question) -> str:
-    """构建发送给 AI 的提示词"""
+    """构建发送给 AI 的提示词，要求严格的输出格式"""
     type_name = TYPE_NAMES.get(question.question_type, "选择题")
-    lines = [f"【{type_name}】\n"]
-    lines.append(f"题目：{question.text}\n")
+    lines = []
+    lines.append(f"这是一道{type_name}，请选出正确答案。")
+    lines.append("")
+    lines.append(f"题目：{question.text}")
+    lines.append("")
 
     if question.options:
-        lines.append("选项：")
         for letter, text in question.options:
-            lines.append(f"  {letter}. {text}")
+            lines.append(f"{letter}. {text}")
         lines.append("")
 
+    # 严格格式要求
+    lines.append("要求：")
+    lines.append("1. 仔细阅读题目和所有选项后再作答")
     if question.question_type == "multiple":
-        lines.append("请选择所有正确的选项（可能不止一个）。")
-        lines.append("输出格式：在第一行写【答案】，后面跟选项字母（如 ABCD）。")
-        lines.append("在第二行开始写【解析】，简要说明理由。")
-        lines.append("示例：\n【答案】AB\n【解析】A选项...正确，B选项...正确...")
+        lines.append("2. 这是多选题，可能有一个或多个正确答案")
+        lines.append("3. 请只输出答案字母，不要输出其他内容")
+        lines.append('输出格式：【答案】ABC（多个字母连写，不要有空格和逗号）')
     elif question.question_type == "judge":
-        lines.append('请判断题目说法是否正确。')
-        lines.append('输出格式：在第一行写【答案】，后面跟"正确"或"错误"。')
-        lines.append("在第二行开始写【解析】，简要说明理由。")
-        lines.append("示例：\n【答案】正确\n【解析】因为...")
+        lines.append("2. 请判断题目说法是否正确")
+        lines.append("3. 请只输出答案，不要输出其他内容")
+        lines.append('输出格式：【答案】正确 或 【答案】错误')
     elif question.question_type == "fill":
-        lines.append("请填写题目的空白处。")
-        lines.append("输出格式：在第一行写【答案】，后面跟填空内容。")
-        lines.append("在第二行开始写【解析】，简要说明理由。")
+        lines.append("2. 请填写题目的空白处")
+        lines.append("3. 请只输出答案，不要输出其他内容")
+        lines.append("输出格式：【答案】填空内容")
     else:
-        lines.append("请选择最正确的一个选项。")
-        lines.append("输出格式：在第一行写【答案】，后面跟选项字母（如 A）。")
-        lines.append("在第二行开始写【解析】，简要说明理由。")
-        lines.append("示例：\n【答案】A\n【解析】因为...")
+        lines.append("2. 这是单选题，只有一个正确答案")
+        lines.append("3. 请只输出答案字母，不要输出其他内容")
+        lines.append("输出格式：【答案】A")
+    lines.append("")
+    lines.append("注意：必须严格按照上述格式输出，第一行必须是【答案】开头。")
 
     return "\n".join(lines)
 
@@ -86,30 +90,27 @@ def parse_response(response: str, question: Question) -> Tuple[List[str], str]:
     reasoning = ""
     answer_letters = []
 
-    # 尝试匹配【答案】XXX 格式
-    answer_pattern = r"【答案】\s*(.+?)(?:\n|$)"
-    reasoning_pattern = r"【解析】\s*(.+)"
+    # 策略1：匹配 【答案】XXX 格式（最可靠）
+    answer_pattern = r"【答案】\s*(.+?)(?:\n|【|$)"
     answer_match = re.search(answer_pattern, response, re.DOTALL)
 
     if answer_match:
         answer_str = answer_match.group(1).strip()
+        logger.debug(f"匹配到答案文本: '{answer_str}'")
 
         if question.question_type == "judge":
-            # 判断题：正确/错误 对应 A/B
-            if "正确" in answer_str or "对" == answer_str.strip():
+            if "正确" in answer_str or answer_str.strip() == "对":
                 answer_letters = ["A"]
-            elif "错误" in answer_str or "错" == answer_str.strip():
+            elif "错误" in answer_str or answer_str.strip() == "错":
                 answer_letters = ["B"]
             else:
                 answer_letters = [answer_str]
         elif question.question_type == "fill":
-            # 填空题：直接返回文本
             answer_letters = [answer_str]
         else:
-            # 选择题：提取字母
+            # 选择题：提取连续的大写字母
             letter_matches = re.findall(r"[A-Z]", answer_str.upper())
             if letter_matches:
-                # 去重并保持顺序
                 seen = set()
                 answer_letters = []
                 for l in letter_matches:
@@ -117,32 +118,64 @@ def parse_response(response: str, question: Question) -> Tuple[List[str], str]:
                         seen.add(l)
                         answer_letters.append(l)
 
-        # 提取解析
+        # 尝试提取解析
+        reasoning_pattern = r"【解析】\s*(.+)"
         reasoning_match = re.search(reasoning_pattern, response, re.DOTALL)
         if reasoning_match:
             reasoning = reasoning_match.group(1).strip()
-    else:
-        # 回退：直接从回复中提取字母
-        if question.question_type in ("single", "multiple"):
-            letter_matches = re.findall(r"[A-D]", response.upper())
-            if letter_matches:
+        else:
+            # 取答案之后的内容作为解析
+            idx = response.find(answer_match.group(0))
+            if idx >= 0:
+                after = response[idx + len(answer_match.group(0)):].strip()
+                if after:
+                    reasoning = after[:500]
+
+    # 策略2：匹配 "答案是X" 或 "选X" 等常见格式
+    if not answer_letters:
+        patterns = [
+            r"答案[是为：:]\s*([A-D]+)",
+            r"选\s*([A-D]+)",
+            r"正确答案[是为：:]\s*([A-D]+)",
+            r"应选\s*([A-D]+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, response, re.IGNORECASE)
+            if m:
+                letters = m.group(1).upper()
                 seen = set()
                 answer_letters = []
-                for l in letter_matches[:4]:  # 最多取4个
+                for l in letters:
                     if l not in seen:
                         seen.add(l)
                         answer_letters.append(l)
-        elif question.question_type == "judge":
-            if "正确" in response or "对" in response:
-                answer_letters = ["A"]
-            elif "错误" in response or "错" in response:
-                answer_letters = ["B"]
+                logger.debug(f"通过模式 '{pat}' 匹配到: {answer_letters}")
+                break
 
-        reasoning = response
+    # 策略3：判断题特殊处理
+    if not answer_letters and question.question_type == "judge":
+        # 检查回复前100字符
+        head = response[:200]
+        if "正确" in head and "不正确" not in head and "错误" not in head:
+            answer_letters = ["A"]
+        elif "错误" in head or "不正确" in head:
+            answer_letters = ["B"]
+
+    # 策略4：最后回退 - 找到回复中第一个出现的选项字母
+    if not answer_letters and question.options:
+        valid_letters = [opt[0] for opt in question.options]
+        for char in response.upper():
+            if char in valid_letters:
+                answer_letters = [char]
+                logger.debug(f"回退匹配到第一个有效字母: {char}")
+                break
 
     # 验证答案是否在有效选项范围内
     if question.options and answer_letters:
         valid_letters = {opt[0] for opt in question.options}
         answer_letters = [l for l in answer_letters if l in valid_letters]
+
+    if not reasoning:
+        reasoning = response[:500]
 
     return answer_letters, reasoning
