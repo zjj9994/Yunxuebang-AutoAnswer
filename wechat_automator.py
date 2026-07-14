@@ -917,51 +917,174 @@ class WeChatMiniProgramAutomator:
     # ===================== 答案选择 =====================
 
     async def select_answer(self, question: Question, answer_letters: List[str]) -> bool:
-        """选择答案（先尝试无障碍树，失败则用 OCR 定位）"""
+        """选择答案 - 多策略点击（无障碍树 → OCR 精确定位 → 坐标比例）"""
         if not answer_letters:
             return False
 
-        # 先尝试无障碍树获取节点
-        nodes = await self.get_screen_nodes()
-
-        # 如果无障碍树没有节点，用 OCR
-        if not nodes:
-            logger.info("无障碍树无节点，使用 OCR 定位选项...")
-            nodes = await self.get_ocr_nodes()
-
-        if not nodes:
-            logger.error("无法获取屏幕节点，使用坐标比例点击")
-            for letter in answer_letters:
-                await asyncio.to_thread(self._click_by_position, letter, question)
-                await asyncio.sleep(0.5)
-            await self.screenshot(f"select_{''.join(answer_letters)}")
-            return True
-
-        success = 0
-        for letter in answer_letters:
-            clicked = await asyncio.to_thread(self._click_option, nodes, letter, question)
+        # 判断题特殊处理：直接用 OCR 找 "正确"/"错误" 文字点击
+        if question.question_type == "judge":
+            clicked = await self._click_judge_answer(answer_letters, question)
             if clicked:
-                success += 1
-                logger.info(f"已选择选项 {letter}")
-            else:
-                logger.warning(f"选项 {letter} 节点匹配失败，尝试 OCR 精确定位...")
-                # 用 OCR 精确定位选项坐标
+                await self.screenshot(f"select_{''.join(answer_letters)}")
+                return True
+            logger.warning("判断题 OCR 点击失败，尝试通用策略...")
+
+        # 通用策略：先尝试无障碍树
+        nodes = await self.get_screen_nodes()
+        if nodes:
+            for letter in answer_letters:
+                clicked = await asyncio.to_thread(self._click_option, nodes, letter, question)
+                if clicked:
+                    logger.info(f"已选择选项 {letter}（无障碍树）")
+                    await asyncio.sleep(0.5)
+                    continue
+                # OCR 精确定位
                 clicked = await self._click_option_by_ocr(letter, question)
                 if clicked:
-                    success += 1
-                    logger.info(f"已通过 OCR 定位选择选项 {letter}")
+                    logger.info(f"已选择选项 {letter}（OCR）")
                 else:
-                    logger.warning(f"选项 {letter} OCR 定位失败，尝试坐标比例点击...")
+                    logger.warning(f"选项 {letter} OCR 定位失败，尝试坐标点击...")
                     clicked = await asyncio.to_thread(self._click_by_position, letter, question)
                     if clicked:
-                        success += 1
-                        logger.info(f"已通过坐标比例选择选项 {letter}")
+                        logger.info(f"已选择选项 {letter}（坐标）")
                     else:
                         logger.error(f"选项 {letter} 所有策略均失败")
-            await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)
+        else:
+            # WebView 模式：直接用 OCR
+            logger.info("WebView 模式，使用 OCR 定位选项...")
+            for letter in answer_letters:
+                clicked = await self._click_option_by_ocr(letter, question)
+                if clicked:
+                    logger.info(f"已选择选项 {letter}（OCR）")
+                else:
+                    logger.warning(f"选项 {letter} OCR 定位失败，尝试坐标点击...")
+                    clicked = await asyncio.to_thread(self._click_by_position, letter, question)
+                    if clicked:
+                        logger.info(f"已选择选项 {letter}（坐标）")
+                    else:
+                        logger.error(f"选项 {letter} 所有策略均失败")
+                await asyncio.sleep(0.5)
 
         await self.screenshot(f"select_{''.join(answer_letters)}")
-        return success > 0
+        return True
+
+    async def _click_judge_answer(self, answer_letters: List[str], question: Question) -> bool:
+        """判断题专用点击：用 OCR 找 '正确'/'错误' 文字并点击"""
+        # 答案 A=正确, B=错误
+        target_texts = []
+        for letter in answer_letters:
+            for opt_l, opt_t in question.options:
+                if opt_l == letter:
+                    target_texts.append(opt_t)
+                    break
+            else:
+                # 没有选项信息时，直接映射
+                if letter == "A":
+                    target_texts.append("正确")
+                elif letter == "B":
+                    target_texts.append("错误")
+
+        if not target_texts:
+            return False
+
+        def _click():
+            if not self._ocr_initialized:
+                self._init_ocr()
+            if not self._ocr_engine:
+                return False
+
+            # 截图
+            self._screenshot_count += 1
+            ts = datetime.now().strftime("%H%M%S")
+            image_path = f"{SCREENSHOT_DIR}/{self._screenshot_count:03d}_{ts}_judge.png"
+            try:
+                self.device.screenshot(image_path)
+            except Exception:
+                return False
+
+            # OCR 识别
+            try:
+                raw_nodes = self._ocr_engine.recognize(image_path)
+            except Exception:
+                return False
+
+            if not raw_nodes:
+                logger.warning("判断题 OCR 无识别结果")
+                return False
+
+            logger.debug(f"判断题 OCR 识别到 {len(raw_nodes)} 个文本块:")
+            for n in raw_nodes:
+                logger.debug(f"  '{n['display'][:40]}' bounds={n.get('bounds_str', '')}")
+
+            for target in target_texts:
+                # 策略1：精确匹配 "正确"/"错误"
+                for node in raw_nodes:
+                    text = node["display"].strip()
+                    bounds = node.get("bounds")
+                    if not bounds:
+                        continue
+                    if text == target:
+                        logger.info(f"OCR 精确匹配 '{target}' at {bounds}")
+                        self.device.click(*bounds)
+                        return True
+
+                # 策略2：包含匹配（OCR 可能多识别了文字）
+                for node in raw_nodes:
+                    text = node["display"].strip()
+                    bounds = node.get("bounds")
+                    if not bounds:
+                        continue
+                    if target in text and len(text) < 20:
+                        logger.info(f"OCR 包含匹配 '{target}' in '{text}' at {bounds}")
+                        self.device.click(*bounds)
+                        return True
+
+                # 策略3：模糊匹配（"对"/"错"）
+                fuzzy = {"正确": ["对", "是对的", "正确"], "错误": ["错", "是错的", "错误"]}
+                for fuzzy_word in fuzzy.get(target, []):
+                    for node in raw_nodes:
+                        text = node["display"].strip()
+                        bounds = node.get("bounds")
+                        if not bounds:
+                            continue
+                        if fuzzy_word in text and len(text) < 20:
+                            logger.info(f"OCR 模糊匹配 '{fuzzy_word}' in '{text}' at {bounds}")
+                            self.device.click(*bounds)
+                            return True
+
+            # 策略4：按位置 - 判断题通常两个选项上下排列
+            # 找屏幕中下方的短文本节点（可能是选项按钮）
+            info = self.device.info
+            sh = info["displayHeight"]
+            sw = info["displayWidth"]
+
+            candidate_buttons = []
+            for node in raw_nodes:
+                text = node["display"].strip()
+                bounds = node.get("bounds")
+                if not bounds:
+                    continue
+                # 在屏幕中间区域，排除太短和太长的文本
+                if 3 <= len(text) <= 10 and bounds[1] > sh * 0.3 and bounds[1] < sh * 0.85:
+                    # 排除题目文本（通常较长）
+                    candidate_buttons.append(node)
+
+            # 按 y 坐标排序
+            candidate_buttons.sort(key=lambda n: n.get("bounds", (0, 0))[1])
+
+            if len(candidate_buttons) >= 2:
+                for i, letter in enumerate(answer_letters):
+                    idx = 0 if letter == "A" else (1 if letter == "B" else min(i, len(candidate_buttons) - 1))
+                    if idx < len(candidate_buttons):
+                        bounds = candidate_buttons[idx].get("bounds")
+                        text = candidate_buttons[idx]["display"].strip()
+                        logger.info(f"判断题按位置点击第{idx+1}个按钮: '{text}' at {bounds}")
+                        self.device.click(*bounds)
+                        return True
+
+            return False
+        return await asyncio.to_thread(_click)
 
     async def _click_option_by_ocr(self, letter: str, question: Question) -> bool:
         """用 OCR 截图精确定位选项坐标并点击"""
@@ -989,26 +1112,29 @@ class WeChatMiniProgramAutomator:
             if not raw_nodes:
                 return False
 
+            logger.debug(f"选项 OCR 识别到 {len(raw_nodes)} 个文本块:")
+            for n in raw_nodes:
+                logger.debug(f"  '{n['display'][:50]}' bounds={n.get('bounds_str', '')}")
+
             # 策略1：找以 "A." "A、" "A)" 等开头的文本块
             for node in raw_nodes:
                 text = node["display"].strip()
                 bounds = node.get("bounds")
                 if not bounds:
                     continue
-                # 匹配 A. xxx / A、xxx / A) xxx 等
                 if re.match(rf"^{letter}\s*[.、）)\].]", text):
-                    logger.debug(f"OCR 匹配选项 {letter}: '{text[:40]}' at {bounds}")
+                    logger.info(f"OCR 匹配选项 {letter}: '{text[:40]}' at {bounds}")
                     self.device.click(*bounds)
                     return True
 
-            # 策略2：找只包含字母的文本块（OCR 可能把选项字母单独识别）
+            # 策略2：找只包含字母的文本块
             for node in raw_nodes:
                 text = node["display"].strip()
                 bounds = node.get("bounds")
                 if not bounds:
                     continue
                 if text == letter:
-                    logger.debug(f"OCR 匹配选项字母 {letter} at {bounds}")
+                    logger.info(f"OCR 匹配选项字母 {letter} at {bounds}")
                     self.device.click(*bounds)
                     return True
 
@@ -1021,30 +1147,63 @@ class WeChatMiniProgramAutomator:
                     bounds = node.get("bounds")
                     if not bounds:
                         continue
-                    if opt_t in text or text in opt_t:
-                        logger.debug(f"OCR 匹配选项内容 {letter}: '{text[:40]}' at {bounds}")
+                    # 精确匹配或包含匹配
+                    if text == opt_t or opt_t in text or text in opt_t:
+                        logger.info(f"OCR 匹配选项内容 {letter}: '{text[:40]}' at {bounds}")
                         self.device.click(*bounds)
                         return True
 
-            # 策略4：按 OCR 节点顺序匹配（A=第1个，B=第2个...）
-            # 找所有看起来像选项的节点（A/B/C/D 开头或短文本）
+            # 策略4：按 OCR 节点 y 坐标顺序匹配
+            # 收集可能是选项的节点（排除状态栏、导航栏等）
+            info = self.device.info
+            sh = info["displayHeight"]
+
             opt_like = []
             for node in raw_nodes:
                 text = node["display"].strip()
                 bounds = node.get("bounds")
                 if not bounds:
                     continue
-                if re.match(r"^[A-D]", text) or (len(text) <= 20 and _is_noise_node(node) is False):
+                # 排除状态栏区域
+                if bounds[1] < sh * 0.15:
+                    continue
+                # 排除题目本身（太长的文本）
+                if len(text) > 100:
+                    continue
+                # 排除页码
+                if _is_page_indicator(text):
+                    continue
+                # 排除题型标签
+                if _is_question_type_label(text):
+                    continue
+                # A/B/C/D 开头 或 短文本（选项通常较短）
+                if re.match(r"^[A-D]", text) or len(text) <= 30:
                     opt_like.append(node)
 
-            if len(opt_like) >= len(question.options):
+            # 按 y 坐标排序
+            opt_like.sort(key=lambda n: n.get("bounds", (0, 9999))[1])
+
+            # 过滤出在选项区域的节点（排除最上方的题目文本）
+            # 选项通常在屏幕 35%-85% 区域
+            opt_area = [n for n in opt_like if sh * 0.3 < n.get("bounds", (0, 0))[1] < sh * 0.9]
+
+            if len(opt_area) >= len(question.options):
                 idx = ord(letter) - 65
-                if idx < len(opt_like):
-                    bounds = opt_like[idx].get("bounds")
-                    if bounds:
-                        logger.debug(f"OCR 按序号匹配选项 {letter} (第{idx+1}个) at {bounds}")
-                        self.device.click(*bounds)
-                        return True
+                if idx < len(opt_area):
+                    bounds = opt_area[idx].get("bounds")
+                    text = opt_area[idx]["display"].strip()
+                    logger.info(f"OCR 按序号匹配选项 {letter} (第{idx+1}个): '{text[:30]}' at {bounds}")
+                    self.device.click(*bounds)
+                    return True
+
+            # 策略5：如果没有选项信息，按屏幕区域等分点击
+            if not question.options and opt_area:
+                idx = ord(letter) - 65
+                if idx < len(opt_area):
+                    bounds = opt_area[idx].get("bounds")
+                    logger.info(f"OCR 按区域匹配选项 {letter} at {bounds}")
+                    self.device.click(*bounds)
+                    return True
 
             return False
         return await asyncio.to_thread(_click)
@@ -1087,16 +1246,21 @@ class WeChatMiniProgramAutomator:
             info = self.device.info
             sw, sh = info["displayWidth"], info["displayHeight"]
             idx = ord(letter) - 65
-            total = max(len(question.options), 4)
+            # 使用实际选项数量，不强制最少 4 个
+            total = len(question.options) if question.options else 4
+            if total < 2:
+                total = 2
+            # 选项区域：屏幕 35%~80%
             y_start = int(sh * 0.35)
-            y_end = int(sh * 0.75)
+            y_end = int(sh * 0.80)
             step = (y_end - y_start) / total
             y = int(y_start + step * (idx + 0.5))
             x = int(sw * 0.5)
             self.device.click(x, y)
-            logger.info(f"坐标点击: ({x},{y})")
+            logger.info(f"坐标点击: ({x},{y}) [共{total}个选项, 第{idx+1}个]")
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"坐标点击失败: {e}")
             return False
 
     def _parse_bounds(self, bounds_str: str) -> Optional[tuple]:
@@ -1260,9 +1424,17 @@ class WeChatMiniProgramAutomator:
             if not raw_nodes:
                 return False
 
+            logger.debug(f"下一题 OCR 识别到 {len(raw_nodes)} 个文本块:")
+            for n in raw_nodes:
+                logger.debug(f"  '{n['display'][:40]}' bounds={n.get('bounds_str', '')}")
+
             # 目标文本：">", "〉", "›", "→", "下一题", "下一页" 等
-            next_symbols = [">", "〉", "›", "→", "❯", "➤", "➜", "〉", "》"]
-            next_texts = ["下一题", "下一页", "继续", "下一道", "下一问", "确定"]
+            next_symbols = [">", "〉", "›", "→", "❯", "➤", "➜", "》", "〉", "›", "﹥", "＞"]
+            next_texts = ["下一题", "下一页", "继续", "下一道", "下一问", "确定", "提交", "交卷"]
+
+            # 获取屏幕尺寸
+            info = self.device.info
+            sw, sh = info["displayWidth"], info["displayHeight"]
 
             # 策略2a：找 ">" 或箭头符号
             for node in raw_nodes:
@@ -1433,16 +1605,48 @@ class WeChatMiniProgramAutomator:
 
             await asyncio.sleep(self.config.question_delay)
 
-            # 点击下一题
-            if not await self.click_next_question():
+            # 点击下一题 - 多次重试
+            next_clicked = False
+            for retry in range(3):
+                if retry > 0:
+                    logger.info(f"重试点击下一题（第 {retry + 1} 次）...")
+                    await asyncio.sleep(1)
+
+                if await self.click_next_question():
+                    next_clicked = True
+                    break
+
+                # 尝试点击"查看结果"等按钮后重试
                 if await self.click_view_result():
                     await asyncio.sleep(1)
-                    if not await self.click_next_question():
-                        logger.info("无法找到下一题按钮，可能答题已完成")
+                    if await self.click_next_question():
+                        next_clicked = True
                         break
-                else:
-                    logger.info("无法找到下一题按钮，可能答题已完成")
-                    break
+
+                # 尝试滑动后重试（按钮可能在屏幕下方）
+                if retry < 2:
+                    await self.scroll_down()
+                    await asyncio.sleep(1)
+
+            if not next_clicked:
+                logger.warning("多次重试后仍无法找到下一题按钮")
+                # 最后尝试：直接点击底部中央和右下角
+                def _last_resort():
+                    try:
+                        info = self.device.info
+                        sw, sh = info["displayWidth"], info["displayHeight"]
+                        # 尝试底部中央
+                        self.device.click(int(sw * 0.5), int(sh * 0.92))
+                        time.sleep(1)
+                        # 尝试右下角
+                        self.device.click(int(sw * 0.9), int(sh * 0.9))
+                        time.sleep(1.5)
+                        return True
+                    except Exception:
+                        return False
+                await asyncio.to_thread(_last_resort)
+                # 不再 break，继续尝试下一题
+                logger.info("已尝试点击底部区域，继续答题...")
 
         # 提交
         if self.config.confirm_before_submit:
