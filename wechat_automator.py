@@ -140,6 +140,10 @@ def _is_button_text(text: str) -> bool:
     return text in BUTTON_TEXTS
 
 
+# 有效单字符（选项字母和导航符号，不应被过滤）
+VALID_SINGLE_CHARS = {"A", "B", "C", "D", ">", "〉", "›", "→", "❯", "➤", "➜", "》", "﹥", "＞"}
+
+
 def _is_noise_node(node: dict) -> bool:
     """判断节点是否是噪音（状态栏、导航栏、按钮等）"""
     text = node.get("display", "").strip()
@@ -166,12 +170,20 @@ def _is_noise_node(node: dict) -> bool:
     if _is_page_indicator(text):
         return True
 
+    # 有效单字符（选项字母 A/B/C/D 和导航符号 >）不过滤
+    if text in VALID_SINGLE_CHARS:
+        return False
+
     # 太短的文本（< 2 个字符，可能是图标 label）
-    if len(text) < 2:
+    # 但保留单个字母 A/B/C/D 和 > 符号
+    if len(text) < 2 and text not in VALID_SINGLE_CHARS:
         return True
 
-    # 纯符号
+    # 纯符号 - 但保留导航符号
     if re.match(r"^[\s\d\W]+$", text) and len(text) < 5:
+        # 检查是否是有效导航符号
+        if any(text.strip() == c for c in VALID_SINGLE_CHARS):
+            return False
         return True
 
     # 状态栏区域（屏幕顶部 y < 150px）
@@ -214,10 +226,16 @@ class OCREngine:
         # 尝试 RapidOCR (轻量级)
         try:
             from rapidocr_onnxruntime import RapidOCR
-            cls._ocr = RapidOCR()
+            # 降低 text_score 阈值以识别单个字母和数字
+            # 默认 0.5 太高，短文本（如 A/B/C/D/>）置信度通常较低
+            try:
+                cls._ocr = RapidOCR(text_score=0.3)
+            except TypeError:
+                # 旧版本不支持 text_score 参数
+                cls._ocr = RapidOCR()
             cls._engine_name = "RapidOCR"
             cls._instance = cls()
-            logger.info("OCR 引擎: RapidOCR")
+            logger.info("OCR 引擎: RapidOCR (text_score=0.3)")
             return cls._instance
         except ImportError:
             pass
@@ -305,7 +323,7 @@ class OCREngine:
             except (ValueError, TypeError):
                 conf = 0.0
 
-            if conf < 0.5 or not text.strip():
+            if conf < 0.3 or not text.strip():
                 continue
 
             box_info = self._parse_box(box)
@@ -330,7 +348,7 @@ class OCREngine:
             except (ValueError, TypeError, IndexError):
                 conf = 0.0
 
-            if conf < 0.5 or not text.strip():
+            if conf < 0.3 or not text.strip():
                 continue
 
             box_info = self._parse_box(box)
@@ -354,7 +372,7 @@ class OCREngine:
             except (ValueError, TypeError, IndexError):
                 conf = 0.0
 
-            if conf < 0.5 or not text.strip():
+            if conf < 0.3 or not text.strip():
                 continue
 
             box_info = self._parse_box(box)
@@ -537,13 +555,16 @@ class WeChatMiniProgramAutomator:
             # OCR 识别
             try:
                 raw_nodes = self._ocr_engine.recognize(image_path)
-                logger.info(f"OCR 识别到 {len(raw_nodes)} 个文本块")
+                logger.info(f"OCR 识别到 {len(raw_nodes)} 个文本块（原始）:")
                 for n in raw_nodes:
-                    logger.debug(f"  OCR: '{n['display'][:60]}' conf={n.get('confidence', 0):.2f} bounds={n['bounds_str']}")
+                    conf = n.get('confidence', 0)
+                    logger.info(f"  OCR: '{n['display'][:60]}' conf={conf:.2f} bounds={n['bounds_str']}")
 
                 # 过滤噪音
                 clean_nodes = [n for n in raw_nodes if not _is_noise_node(n)]
-                logger.info(f"OCR 过滤后剩余 {len(clean_nodes)} 个有效节点")
+                logger.info(f"OCR 过滤后剩余 {len(clean_nodes)} 个有效节点:")
+                for n in clean_nodes:
+                    logger.info(f"  [有效] '{n['display'][:60]}' bounds={n['bounds_str']}")
                 return clean_nodes
             except Exception as e:
                 logger.warning(f"OCR 识别失败: {e}")
