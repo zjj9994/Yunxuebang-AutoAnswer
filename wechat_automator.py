@@ -313,6 +313,48 @@ class OCREngine:
             logger.debug(f"图像预处理失败: {e}")
             return image_path
 
+    def _nodes_overlap(self, n1: dict, n2: dict, threshold: float = 0.5) -> bool:
+        """判断两个节点的坐标是否重叠（基于 bounds_str 解析）"""
+        def parse_bounds_str(s):
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", s)
+            if m:
+                return tuple(map(int, m.groups()))
+            return None
+
+        b1 = parse_bounds_str(n1.get("bounds_str", ""))
+        b2 = parse_bounds_str(n2.get("bounds_str", ""))
+        if not b1 or not b2:
+            # 回退：用中心点距离判断
+            c1 = n1.get("bounds")
+            c2 = n2.get("bounds")
+            if c1 and c2:
+                dist = ((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)**0.5
+                return dist < 50
+            return False
+
+        x1_1, y1_1, x2_1, y2_1 = b1
+        x1_2, y1_2, x2_2, y2_2 = b2
+
+        # 计算重叠区域
+        ix1 = max(x1_1, x1_2)
+        iy1 = max(y1_1, y1_2)
+        ix2 = min(x2_1, x2_2)
+        iy2 = min(y2_1, y2_2)
+
+        if ix2 <= ix1 or iy2 <= iy1:
+            return False
+
+        overlap_area = (ix2 - ix1) * (iy2 - iy1)
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+
+        if area1 == 0 or area2 == 0:
+            return False
+
+        # 重叠面积占较小节点的比例
+        smaller_area = min(area1, area2)
+        return overlap_area / smaller_area > threshold
+
     def recognize(self, image_path: str) -> list:
         """
         识别图片中的文字（双次识别：原图 + 预处理图）
@@ -348,12 +390,19 @@ class OCREngine:
                 else:
                     nodes2 = []
 
-                # 合并结果：去重（相同坐标的节点只保留一个）
-                existing_texts = {n["display"] for n in all_nodes}
+                # 合并结果：按坐标重叠去重
+                # 如果新节点和已有节点坐标重叠，保留置信度更高的
                 for node in nodes2:
-                    if node["display"] not in existing_texts:
+                    overlap_found = False
+                    for i, existing in enumerate(all_nodes):
+                        if self._nodes_overlap(node, existing):
+                            overlap_found = True
+                            # 保留置信度更高的，或者文本更长的
+                            if node.get("confidence", 0) > existing.get("confidence", 0):
+                                all_nodes[i] = node
+                            break
+                    if not overlap_found:
                         all_nodes.append(node)
-                        existing_texts.add(node["display"])
             except Exception as e:
                 logger.error(f"预处理图 OCR 异常: {e}", exc_info=True)
             finally:
@@ -819,6 +868,7 @@ class WeChatMiniProgramAutomator:
 
             # 检查是否是选项（只有字母 A/B/C/D）
             if re.match(r"^([A-D])$", text) and len(text) == 1:
+                # 字母单独识别，稍后和同 y 坐标的文字配对
                 option_candidates.append((text, "", node))
                 continue
 
@@ -843,8 +893,64 @@ class WeChatMiniProgramAutomator:
 
             question_candidates.append((text, node))
 
-        # 合并判断题选项
-        if judge_option_nodes and not option_candidates:
+        # === 关键步骤：将单独的字母节点和同 y 坐标的文字节点配对 ===
+        # OCR 常把 "A" 和 "正确" 分成两个节点，需要合并
+        if option_candidates:
+            # 找出内容为空的字母节点
+            empty_letters = [oc for oc in option_candidates if not oc[1]]
+            filled_letters = [oc for oc in option_candidates if oc[1]]
+
+            for empty_oc in empty_letters:
+                letter = empty_oc[0]
+                letter_y = empty_oc[2].get("bounds", (0, 9999))[1]
+                letter_x = empty_oc[2].get("bounds", (0, 0))[0]
+
+                # 先在 judge_option_nodes 中找同 y 坐标的
+                matched = False
+                for jo in judge_option_nodes:
+                    jo_y = jo[2].get("bounds", (0, 9999))[1]
+                    # y 坐标差距小于 60px 认为是同一行
+                    if abs(jo_y - letter_y) < 60:
+                        # 配对成功
+                        empty_oc_list = list(empty_oc)
+                        empty_oc_list[1] = jo[1]
+                        option_candidates[option_candidates.index(empty_oc)] = tuple(empty_oc_list)
+                        matched = True
+                        # 从 judge_option_nodes 中移除已配对的
+                        judge_option_nodes.remove(jo)
+                        break
+
+                # 如果没在 judge_option_nodes 中找到，在 question_candidates 中找
+                if not matched:
+                    best_match = None
+                    best_dist = 9999
+                    for text, node in question_candidates:
+                        ny = node.get("bounds", (0, 9999))[1]
+                        nx = node.get("bounds", (0, 0))[0]
+                        # 同一行（y 差距小于 60px）且在字母右侧
+                        if abs(ny - letter_y) < 60 and nx > letter_x:
+                            dist = abs(ny - letter_y) + abs(nx - letter_x) * 0.1
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_match = (text, node)
+
+                    if best_match:
+                        empty_oc_list = list(empty_oc)
+                        empty_oc_list[1] = best_match[0]
+                        option_candidates[option_candidates.index(empty_oc)] = tuple(empty_oc_list)
+                        # 从 question_candidates 中移除已配对的
+                        question_candidates.remove(best_match)
+
+        # 合并判断题选项（未被字母配对的剩余选项）
+        if judge_option_nodes:
+            # 检查是否已有同字母的选项
+            existing_letters = {oc[0] for oc in option_candidates if oc[1]}
+            for jo in judge_option_nodes:
+                if jo[0] not in existing_letters:
+                    option_candidates.append(jo)
+
+        # 如果有判断题标签且有 正确/错误 但没有字母配对，直接用判断题选项
+        if detected_type_from_label == "judge" and judge_option_nodes and not any(oc[1] for oc in option_candidates):
             option_candidates = judge_option_nodes
 
         # 有选项的情况
@@ -945,6 +1051,15 @@ class WeChatMiniProgramAutomator:
             if has_correct and has_wrong:
                 options = [("A", "正确"), ("B", "错误")]
 
+        # 即使没有 "判断题" 标签，如果有 正确/错误 选项也判断为判断题
+        if not options:
+            has_correct = bool(re.search(r"(?<![不对])正确(?![答案])", full_text))
+            has_wrong = "错误" in full_text
+            if has_correct and has_wrong:
+                options = [("A", "正确"), ("B", "错误")]
+                if not detected_type or detected_type == "fill":
+                    detected_type = "judge"
+
         # 如果还没检测到题型，根据选项推断
         if not detected_type:
             if options and len(options) >= 2:
@@ -973,6 +1088,9 @@ class WeChatMiniProgramAutomator:
 
         # 清理题型标签和页码指示器
         question_text = _clean_question_text(question_text)
+
+        # 移除题目中残留的括号（如 （）真空干燥... → 真空干燥...）
+        question_text = re.sub(r"^[（）()]+", "", question_text).strip()
 
         # 清理多余换行和空格
         question_text = re.sub(r"\n{2,}", "\n", question_text).strip()
@@ -1003,14 +1121,25 @@ class WeChatMiniProgramAutomator:
         return questions
 
     def _detect_type(self, text: str, options: list) -> str:
+        # 判断题标签优先
         if "判断题" in text:
             return "judge"
+        # 多选题
         if "多选题" in text or "多选" in text:
             return "multiple"
-        if "填空题" in text or "____" in text or "（）" in text or "(  )" in text:
-            return "fill"
+        # 判断题：有 "正确"/"错误" 选项时优先于填空题
+        # （即使文本中有 （），只要同时有 正确/错误 选项就是判断题）
+        if options:
+            opt_texts = [opt[1] for opt in options if opt[1]]
+            if "正确" in opt_texts and "错误" in opt_texts:
+                return "judge"
+        # 无选项时检查文本
         if not options and "正确" in text and "错误" in text and len(text) < 200:
             return "judge"
+        # 填空题
+        if "填空题" in text or "____" in text:
+            return "fill"
+        # （）不单独作为填空题依据，因为判断题题目中也可能有括号
         return "single"
 
     def _extract_options_from_text(self, text: str) -> List[tuple]:
