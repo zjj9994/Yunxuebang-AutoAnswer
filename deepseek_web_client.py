@@ -299,15 +299,33 @@ class DeepSeekWebClient:
         start_time = time.time()
         poll_interval = 1.5
 
-        # 阶段1：等待回复开始出现（最多等15秒）
-        stage1_timeout = 15
+        # 阶段1：等待回复开始出现（最多等20秒）
+        # 不再依赖 _count_responses（选择器可能不匹配），改为直接提取文本
+        stage1_timeout = 20
+        initial_text = ""
+        # 记录发送前的文本
+        try:
+            initial_text = await self._extract_latest_response() or ""
+        except Exception:
+            pass
+        logger.debug(f"发送前页面文本: '{initial_text[:80]}'")
+
+        detected_start = False
         while time.time() - start_time < stage1_timeout:
-            current_count = await self._count_responses()
-            if current_count > self._last_response_count:
-                logger.debug("检测到新回复开始生成")
+            current_text = await self._extract_latest_response()
+            # 如果提取到的文本和发送前不同（变长或有新内容），说明回复开始了
+            if current_text and current_text != initial_text:
+                logger.info("检测到回复开始生成")
+                detected_start = True
+                break
+            # 也检测生成状态
+            if await self._is_still_generating():
+                logger.info("检测到正在生成（停止按钮可见）")
+                detected_start = True
                 break
             await self.page.wait_for_timeout(int(poll_interval * 1000))
-        else:
+
+        if not detected_start:
             logger.warning("未检测到回复开始，尝试直接等待完成...")
 
         # 阶段2：等待回复完成（内容稳定 + 停止按钮消失）
@@ -315,6 +333,7 @@ class DeepSeekWebClient:
         stable_count = 0
         required_stable = 3  # 连续3次内容不变视为完成
         poll_count = 0
+        last_log_time = start_time
 
         while time.time() - start_time < timeout:
             is_generating = await self._is_still_generating()
@@ -327,20 +346,34 @@ class DeepSeekWebClient:
                 stable_count = 0
                 last_text = current_text
 
-            # 每3次轮询记录一次提取到的内容
-            if poll_count % 3 == 0 and current_text:
-                logger.debug(f"轮询中 ({poll_count}次), 当前文本: {current_text[:80]}...")
+            # 每5秒记录一次状态（不要太频繁）
+            now = time.time()
+            if now - last_log_time > 5:
+                last_log_time = now
+                elapsed = now - start_time
+                text_preview = (current_text or "")[:60]
+                logger.info(
+                    f"等待中... {elapsed:.0f}s, 稳定={stable_count}/{required_stable}, "
+                    f"生成中={is_generating}, 文本='{text_preview}'"
+                )
 
             # 内容稳定且不再生成
             if stable_count >= required_stable and not is_generating and current_text:
                 elapsed = time.time() - start_time
                 logger.info(f"DeepSeek 回复完成（耗时 {elapsed:.1f}s）")
-                logger.debug(f"最终回复内容（前200字）:\n{current_text[:200]}")
+                logger.info(f"回复内容（前200字）: {current_text[:200]}")
+                return current_text
+
+            # 即使还在生成，但如果内容已经包含【答案】且稳定了3次，也可以返回
+            if stable_count >= required_stable and current_text and "【答案】" in current_text:
+                elapsed = time.time() - start_time
+                logger.info(f"DeepSeek 回复完成（检测到答案，耗时 {elapsed:.1f}s）")
+                logger.info(f"回复内容（前200字）: {current_text[:200]}")
                 return current_text
 
             await self.page.wait_for_timeout(int(poll_interval * 1000))
 
-        logger.warning(f"等待回复超时（{timeout}s），返回最后内容")
+        logger.warning(f"等待回复超时（{timeout}s），返回最后内容: '{last_text[:80]}'")
         return last_text
 
     async def _is_still_generating(self) -> bool:
@@ -411,11 +444,11 @@ class DeepSeekWebClient:
 
     def _is_ui_text(self, text: str) -> bool:
         """判断文本是否是 DeepSeek 页面的 UI 文本而非 AI 回复"""
-        # 包含【答案】的一定是有效回复
-        if "【答案】" in text:
+        # 包含【答案】或【解析】的一定是有效回复
+        if "【答案】" in text or "【解析】" in text:
             return False
-        # 太短的不可能是有效回复
-        if len(text) < 10:
+        # 太短的不可能是有效回复（但至少要 > 3 个字符才检查）
+        if len(text) < 5:
             return True
         # 检查黑名单
         for pattern in self.UI_BLACKLIST_PATTERNS:
@@ -456,7 +489,7 @@ class DeepSeekWebClient:
 
                 function isUiText(text) {
                     if (text.includes('【答案】') || text.includes('【解析】')) return false;
-                    if (text.length < 10) return true;
+                    if (text.length < 5) return true;
                     for (const kw of uiBlacklist) {
                         if (text.includes(kw)) return true;
                     }
@@ -480,6 +513,8 @@ class DeepSeekWebClient:
                     if (text.includes('这是一道') && text.includes('题目：')) return true;
                     if (text.includes('请只输出答案') || text.includes('输出格式')) return true;
                     if (text.includes('请选出正确答案')) return true;
+                    // 填空题提示词
+                    if (text.includes('请填写题目') && text.includes('空白处')) return true;
                     return false;
                 }
 

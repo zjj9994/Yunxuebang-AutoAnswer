@@ -1158,6 +1158,8 @@ class WeChatMiniProgramAutomator:
         if not answer_letters:
             return False
 
+        success_count = 0
+
         # 判断题特殊处理：直接用 OCR 找 "正确"/"错误" 文字点击
         if question.question_type == "judge":
             clicked = await self._click_judge_answer(answer_letters, question)
@@ -1173,17 +1175,20 @@ class WeChatMiniProgramAutomator:
                 clicked = await asyncio.to_thread(self._click_option, nodes, letter, question)
                 if clicked:
                     logger.info(f"已选择选项 {letter}（无障碍树）")
+                    success_count += 1
                     await asyncio.sleep(0.5)
                     continue
                 # OCR 精确定位
                 clicked = await self._click_option_by_ocr(letter, question)
                 if clicked:
                     logger.info(f"已选择选项 {letter}（OCR）")
+                    success_count += 1
                 else:
                     logger.warning(f"选项 {letter} OCR 定位失败，尝试坐标点击...")
                     clicked = await asyncio.to_thread(self._click_by_position, letter, question)
                     if clicked:
                         logger.info(f"已选择选项 {letter}（坐标）")
+                        success_count += 1
                     else:
                         logger.error(f"选项 {letter} 所有策略均失败")
                 await asyncio.sleep(0.5)
@@ -1194,16 +1199,21 @@ class WeChatMiniProgramAutomator:
                 clicked = await self._click_option_by_ocr(letter, question)
                 if clicked:
                     logger.info(f"已选择选项 {letter}（OCR）")
+                    success_count += 1
                 else:
                     logger.warning(f"选项 {letter} OCR 定位失败，尝试坐标点击...")
                     clicked = await asyncio.to_thread(self._click_by_position, letter, question)
                     if clicked:
                         logger.info(f"已选择选项 {letter}（坐标）")
+                        success_count += 1
                     else:
                         logger.error(f"选项 {letter} 所有策略均失败")
                 await asyncio.sleep(0.5)
 
         await self.screenshot(f"select_{''.join(answer_letters)}")
+        if success_count == 0:
+            logger.error("所有选项点击均失败！")
+            return False
         return True
 
     async def _click_judge_answer(self, answer_letters: List[str], question: Question) -> bool:
@@ -1992,9 +2002,15 @@ class WeChatMiniProgramAutomator:
             if result.success and result.answer_letters:
                 if question.question_type == "fill":
                     # 填空题：传入所有答案（answer_letters 是答案文本列表）
-                    await self.fill_answer(question, result.answer_letters)
+                    fill_ok = await self.fill_answer(question, result.answer_letters)
+                    if not fill_ok:
+                        logger.warning("填空题填写失败！等待用户确认...")
+                        self.wait_for_user_ready("填空题填写失败，请手动填写后按回车继续")
                 else:
-                    await self.select_answer(question, result.answer_letters)
+                    select_ok = await self.select_answer(question, result.answer_letters)
+                    if not select_ok:
+                        logger.warning("选项选择失败！等待用户确认...")
+                        self.wait_for_user_ready("选项选择失败，请手动选择后按回车继续")
                 if result.reasoning:
                     logger.info(f"解析: {result.reasoning[:150]}")
             else:
